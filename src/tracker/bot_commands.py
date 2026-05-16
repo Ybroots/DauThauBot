@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import time
 from typing import Optional
 
@@ -12,8 +13,18 @@ from tenacity import RetryError
 from .config import Secrets, load_keywords
 from .crawler import BlockedException
 from .interactive_search import parse_keyword_phrases, run_interactive_keyword_search
-from .storage import count_sent_since, init_db
+from .storage import (
+    count_sent_since,
+    count_sent_since_hours,
+    count_unsent_in_db,
+    init_db,
+    list_recent_bids,
+    list_unsent,
+    total_bids_in_db,
+)
 from .__main__ import run_once
+
+BOT_VERSION = "0.1.0"
 
 POLL_TIMEOUT = 30
 
@@ -61,6 +72,32 @@ def _cooldown_ok(secrets: Secrets, chat_key: str) -> tuple[bool, int]:
 
 def _mark_search_done(chat_key: str) -> None:
     _last_search_ts[chat_key] = time.time()
+
+
+def _is_privileged(secrets: Secrets, *, chat_id: int | str, user_id: int) -> bool:
+    """Cho /test khi TELEGRAM_ADMIN_CHAT_ID trùng chat hoặc user (thường là user id cá nhân)."""
+    admin = (secrets.admin_chat_id or "").strip()
+    if not admin:
+        return True
+    return str(chat_id).strip() == admin or str(user_id).strip() == admin
+
+
+def _parse_positive_int(rest: str, *, default: int, max_v: int, min_v: int = 1) -> int:
+    s = rest.strip()
+    if not s:
+        return default
+    try:
+        n = int(s.split()[0])
+        return max(min_v, min(n, max_v))
+    except ValueError:
+        return default
+
+
+def _truncate(s: str, max_len: int) -> str:
+    s = s.replace("\n", " ").strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
 
 
 def _cmd_and_rest(text: str) -> tuple[str, str]:
@@ -154,24 +191,76 @@ def HELP_VI() -> str:
         "Chat riêng: gõ một dòng từ khóa (VD: camera) là tra luôn, không cần /tim.\n"
         "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true để gõ thẳng như chat riêng.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
-        "Khác: /keywords  /stats  /test  /hủy"
+        "Lệnh khác: /lenh — danh sách ngắn. /thongke /lichsu /chuagui /keywords /id /ping /test /hủy"
     )
 
 
-def handle_slash(full_text: str, secrets: Secrets, _chat_type: Optional[str]) -> Optional[str]:
+def COMMAND_LIST_VI() -> str:
+    return (
+        "Lệnh bot DauThauBot:\n"
+        "• /tim — tra TBMT theo từ khóa (xem /help)\n"
+        "• /thongke — gửi tin 24h / 7 ngày / 30 ngày + tổng DB + chưa gửi\n"
+        "• /lichsu [n] — n tin gần nhất trong DB (mặc định 10, tối đa 25)\n"
+        "• /chuagui — các gói đã thấy nhưng chưa gửi Telegram (tối đa 15 dòng)\n"
+        "• /keywords — từ khóa cron (keywords.yaml)\n"
+        "• /stats — tóm tắt 7 ngày (giữ tương thích)\n"
+        "• /id — chat_id & user_id (điền .env)\n"
+        "• /ping /about — bot sống + phiên bản\n"
+        "• /test — chạy 1 vòng tracker (cần quyền admin nếu có TELEGRAM_ADMIN_CHAT_ID)\n"
+        "• /help /gioithieu — hướng dẫn dài\n"
+        "• /hủy — thoát bước chờ từ khóa sau /tim"
+    )
+
+
+def handle_slash(
+    full_text: str,
+    secrets: Secrets,
+    _chat_type: Optional[str],
+    *,
+    chat_id: int | str,
+    user_id: int,
+) -> Optional[str]:
     """Trả text trả lời (plain) hoặc None nếu đã xử lý không cần gửi thêm."""
     cmd, rest = _cmd_and_rest(full_text)
 
     if cmd in ("/start", "/help", "/gioithieu"):
         return HELP_VI()
 
+    if cmd in ("/lenh", "/commands"):
+        return COMMAND_LIST_VI()
+
+    if cmd == "/ping":
+        return f"pong — DauThauBot v{BOT_VERSION}"
+
+    if cmd in ("/about", "/phienban"):
+        return (
+            f"DauThauBot v{BOT_VERSION}\n"
+            "Nguồn: https://github.com/Ybroots/DauThauBot\n"
+            "Tracker: muasamcong.mpi.gov.vn → SQLite → Telegram"
+        )
+
+    if cmd in ("/id", "/ma"):
+        cid = html.escape(str(chat_id), quote=False)
+        uid_s = html.escape(str(user_id), quote=False)
+        return (
+            "<b>Định danh Telegram</b>\n"
+            f"<code>{cid}</code> — chat_id\n"
+            f"<code>{uid_s}</code> — user_id\n"
+            "Gán vào .env: TELEGRAM_CHAT_IDS / TELEGRAM_ADMIN_CHAT_ID."
+        )
+
     if cmd == "/keywords":
         cfg = load_keywords()
         lines = "\n".join(f"• {k}" for k in cfg.keywords) or "(trống)"
+        loc = ", ".join(cfg.locations) if cfg.locations else "(không)"
+        fld = ", ".join(cfg.fields) if cfg.fields else "(không)"
+        budget = cfg.min_budget_vnd
+        btxt = f"{budget:,} đ".replace(",", ".") if budget else "(không)"
         return (
             "Từ khóa cron (keywords.yaml):\n"
             + lines
-            + "\n\nChỉnh file config/keywords.yaml trên máy host."
+            + f"\n\nĐịa điểm lọc: {loc}\nLĩnh vực lọc: {fld}\nNgân sách tối thiểu: {btxt}\n"
+            + "\nChỉnh file trên máy host; bot không ghi lại file này."
         )
 
     if cmd == "/stats":
@@ -179,7 +268,49 @@ def handle_slash(full_text: str, secrets: Secrets, _chat_type: Optional[str]) ->
         n = count_sent_since(7)
         return f"Đã gửi {n} gói thầu (đánh dấu đã tin) trong 7 ngày qua."
 
+    if cmd in ("/thongke", "/dashboard"):
+        init_db()
+        h24 = count_sent_since_hours(24)
+        d7 = count_sent_since(7)
+        d30 = count_sent_since(30)
+        tot = total_bids_in_db()
+        uns = count_unsent_in_db()
+        return (
+            "Thống kê (SQLite seen.db):\n"
+            f"• Đã gửi Telegram — 24h: {h24} | 7 ngày: {d7} | 30 ngày: {d30}\n"
+            f"• Tổng dòng trong DB: {tot}\n"
+            f"• Đã thấy nhưng chưa gửi: {uns}"
+        )
+
+    if cmd in ("/lichsu", "/recent"):
+        init_db()
+        n = _parse_positive_int(rest, default=10, max_v=25)
+        rows = list_recent_bids(n)
+        if not rows:
+            return "Chưa có dữ liệu trong DB (chạy tracker hoặc /test)."
+        lines = []
+        for code, title, seen_at, sent in rows:
+            flag = "đã gửi" if sent else "chưa gửi"
+            short_at = seen_at[:19].replace("T", " ") if len(seen_at) >= 19 else seen_at
+            lines.append(f"• [{flag}] {code} — {_truncate(title, 72)}\n  {short_at} UTC")
+        return f"{len(rows)} tin gần nhất:\n" + "\n".join(lines)
+
+    if cmd in ("/chuagui", "/unsent"):
+        init_db()
+        rows = list_unsent()
+        if not rows:
+            return "Không có gói chưa gửi (sent_to_telegram=0)."
+        cap = 15
+        lines = [f"• {c} — {_truncate(t, 80)}" for c, t in rows[:cap]]
+        more = f"\n… và {len(rows) - cap} gói nữa." if len(rows) > cap else ""
+        return f"Chưa gửi Telegram ({len(rows)} gói):\n" + "\n".join(lines) + more
+
     if cmd == "/test":
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return (
+                "Lệnh /test chỉ dành cho admin.\n"
+                "Đặt TELEGRAM_ADMIN_CHAT_ID = chat_id hoặc user_id của bạn (dùng /id)."
+            )
         run_once()
         return "Đã chạy 1 chu kỳ tracker (cron). Xem logs/ trên máy host."
 
@@ -225,9 +356,15 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _reply(bot_token, chat_id, hint)
         return
 
-    routed = handle_slash(text.strip(), secrets, chat_type)
+    routed = handle_slash(
+        text.strip(),
+        secrets,
+        chat_type,
+        chat_id=chat_id,
+        user_id=int(uid),
+    )
     if routed:
-        _reply(bot_token, chat_id, routed)
+        _reply(bot_token, chat_id, routed, parse_html=cmd in ("/id", "/ma"))
         return
 
     if cmd:
@@ -270,7 +407,9 @@ def poll_loop() -> None:
     init_db()
 
     offset: int | None = None
-    logger.info("Bot Telegram đang lắng nghe (getUpdates). Lệnh: /tim ...")
+    logger.info(
+        "Bot Telegram đang lắng nghe (getUpdates). Lệnh: /tim /lenh /thongke /lichsu …"
+    )
     logger.warning(
         "Chỉ chạy một process getUpdates/trên một token bot. Scheduler + tracker vẫn chạy bình thường.",
     )

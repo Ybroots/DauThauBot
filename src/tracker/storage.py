@@ -67,6 +67,58 @@ def count_sent_since(days: int = 7) -> int:
         return int(row[0]) if row else 0
 
 
+def count_sent_since_hours(hours: int) -> int:
+    from datetime import timedelta
+
+    if hours <= 0:
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            SELECT COUNT(*) FROM seen_bids
+            WHERE sent_to_telegram = 1 AND seen_at >= ?
+            """,
+            (cutoff,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+def total_bids_in_db() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM seen_bids").fetchone()
+        return int(row[0]) if row else 0
+
+
+def count_unsent_in_db() -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM seen_bids WHERE sent_to_telegram = 0"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+
+def list_recent_bids(limit: int = 10) -> list[tuple[str, str, str, int]]:
+    """tbmt_code, title, seen_at (ISO), sent_to_telegram — mới nhất trước."""
+    limit = max(1, min(int(limit), 50))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            SELECT tbmt_code, title, seen_at, sent_to_telegram
+            FROM seen_bids
+            ORDER BY seen_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    out: list[tuple[str, str, str, int]] = []
+    for r in rows:
+        out.append((str(r[0]), str(r[1] or ""), str(r[2]), int(r[3])))
+    return out
+
+
 def list_unsent() -> list[tuple[str, str]]:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(

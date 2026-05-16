@@ -56,8 +56,12 @@ python -m tracker.bot_commands
 
 - `/tim` → bot gợi ý nhập từ khóa; tin tiếp theo (vd `camera, lâm đồng`) sẽ cào và gửi kết quả **ngay** trong chat đó (**không** ghi `seen.db`; khác luồng cron).
 - `/tim camera | máy chủ` — tra một lần với các từ OR.
-- `/help` — hướng dẫn.
-- `/keywords`, `/stats`, `/test` — như trước.
+- `/help` — hướng dẫn dài; `/lenh` — danh sách lệnh ngắn.
+- `/thongke` — thống kê 24h / 7d / 30d + tổng DB + chưa gửi; `/stats` — gói đã gửi 7 ngày.
+- `/lichsu [n]` — n tin gần nhất trong `seen.db` (mặc định 10); `/chuagui` — gói chưa gửi Telegram.
+- `/keywords` — từ khóa + bộ lọc cron; `/id` — `chat_id` / `user_id` để điền `.env`.
+- `/ping`, `/about` — kiểm tra bot + phiên bản.
+- `/test` — chạy một vòng tracker; nếu có `TELEGRAM_ADMIN_CHAT_ID` thì chỉ chat/user khớp mới gọi được.
 
 **Chat riêng:** có thể gõ thẳng một dòng từ khóa không cần `/tim`.
 
