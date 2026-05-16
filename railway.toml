@@ -1,0 +1,9 @@
+# Railway: ưu tiên build bằng Dockerfile (Playwright). Nếu dùng Nixpacks, Procfile đã set PYTHONPATH=src.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python -m tracker.railway_main"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

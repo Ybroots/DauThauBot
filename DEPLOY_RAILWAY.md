@@ -232,7 +232,8 @@ Nếu không thấy → xem **Phần H**.
 | Mỗi lần deploy mất hết “đã gửi” | Chưa có volume hoặc `DATA_DIR` không trỏ `/data`. |
 | Bot không trả lời | Token sai; hoặc vẫn chạy **một process khác** `getUpdates` cùng token; hoặc Group Privacy / bot không vào đúng nhóm. |
 | `/tim` lỗi reCAPTCHA / timeout | Thử giảm tần suất gọi; tăng `POLL_INTERVAL_MINUTES`; kiểm tra log chi tiết; trên cloud đôi khi cần thử `PLAYWRIGHT_HEADLESS=false` (không phải lúc nào cũng khả thi trên Railway). |
-| `ModuleNotFoundError` | `requirements.txt` / image thiếu package — so với repo. |
+| `ModuleNotFoundError: No module named 'tracker'` | Code nằm trong `src/` — bật build **Dockerfile** (repo đã `pip install .` trong image). Hoặc Nixpacks: dùng `Procfile` có `PYTHONPATH=src`. Settings → Build → **Dockerfile**, không chỉ Nixpacks + Procfile trống. |
+| `ModuleNotFoundError` (khác) | `requirements.txt` / image thiếu package — so với repo. |
 
 ---
 

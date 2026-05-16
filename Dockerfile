@@ -12,6 +12,11 @@ COPY pyproject.toml README.md ./
 COPY config ./config
 COPY src ./src
 
+# Cài package tracker (src/tracker) vào site-packages — tránh ModuleNotFoundError
+RUN pip install --no-cache-dir .
+
+ENV PYTHONPATH=/app/src
+
 # Volume Railway gắn tại /data (SQLite + tuỳ chọn keywords.yaml)
 ENV DATA_DIR=/data
 
