@@ -241,7 +241,8 @@ Nếu không thấy → xem **Phần H**.
 | `[run_railway] THIEU package: httpx` | Build chưa `pip install -r requirements.txt` — dùng Dockerfile hoặc xem log tab **Build**. |
 | `ZoneInfoNotFoundError: Asia/Ho_Chi_Minh` / `No module named 'tzdata'` | Repo đã thêm package **`tzdata`** trong `requirements.txt`; **Redeploy + Clear build cache** để layer `pip install` chạy lại. |
 | **Build image failed** sau khi sửa Dockerfile | Thường do `apt-get install tzdata` hỏi timezone — image hiện chỉ dùng **`pip install tzdata`**, không apt. Xem tab **Build Logs** dòng đỏ cuối. |
-| Playwright `Executable doesn't exist` / cần `v1.59.0-jammy` | `pip install playwright` mới hơn browser trong image — repo pin **`playwright==1.49.0`** + image **`v1.49.0-jammy`**. Redeploy clear cache. |
+| Playwright `Executable doesn't exist` | Không `pip install playwright` trong Docker — dùng browser có sẵn trong image **`v1.49.0-jammy`** (`requirements-docker.txt`). |
+| **Build image failed** (sau pin playwright) | Xem **Build Logs**; thường do assert version — image mới dùng `requirements-docker.txt` không cài playwright qua pip. |
 | `DH_KEY_TOO_SMALL` SSL | Đã xử lý trong crawler (SECLEVEL=1); redeploy bản mới. |
 | `ModuleNotFoundError` (khác) | `requirements.txt` / image thiếu package — so với repo. |
 

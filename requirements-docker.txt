@@ -1,4 +1,4 @@
-# Railway / Docker / pip — đồng bộ với pyproject.toml
+# Chỉ dùng trong Docker — KHÔNG cài playwright qua pip (dùng bản có sẵn trong image).
 httpx[http2]>=0.27.0
 pydantic>=2.0
 pydantic-settings>=2.0
@@ -9,4 +9,3 @@ loguru>=0.7
 pytz>=2024.1
 tzdata>=2024.1
 tenacity>=8.2
-playwright==1.49.0
