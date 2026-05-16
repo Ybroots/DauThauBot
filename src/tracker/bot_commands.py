@@ -237,6 +237,7 @@ def _execute_search(
             secrets.telegram_bot_token,
             target_chat_id,
             f"Chờ thêm ~{secs}s rồi tra tiếp (tránh spam cào nhiều lần).",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
         )
         return
     mode_note = " [AND — tất cả phải khớp]" if mode == "all" else ""
@@ -272,12 +273,18 @@ def _execute_search(
             secrets.telegram_bot_token,
             target_chat_id,
             f"Trang chủ thầu tạm chặn hoặc lỗi mạng (HTTP {e.status_code}). Thử sau vài tiếng.",
+            reply_markup=_after_search_kb(include_closed),
         )
     except RuntimeError as e:
         msg = str(e)
         if "reCAPTCHA" in msg or "invalid site key" in msg.lower():
             logger.warning("interactive search reCAPTCHA/runtime: {}", msg)
-            _reply(secrets.telegram_bot_token, target_chat_id, msg[:900])
+            _reply(
+                secrets.telegram_bot_token,
+                target_chat_id,
+                msg[:900],
+                reply_markup=_after_search_kb(include_closed),
+            )
             return
         raise
     except RetryError:
@@ -288,6 +295,7 @@ def _execute_search(
             "Lỗi cào sau vài lần thử (thường do reCAPTCHA / site key). "
             "Cập nhật bản Tool mới nhất; thử PLAYWRIGHT_HEADLESS=false hoặc PLAYWRIGHT_CHANNEL=chrome trong .env. "
             "Chi tiết: file logs/tracker_*.log",
+            reply_markup=_after_search_kb(include_closed),
         )
     except Exception:
         logger.exception("interactive search failed")
@@ -295,6 +303,7 @@ def _execute_search(
             secrets.telegram_bot_token,
             target_chat_id,
             "Lỗi khi cào hoặc gửi Telegram. Xem logs/ trên máy chạy bot.",
+            reply_markup=_after_search_kb(include_closed),
         )
 
 
@@ -406,7 +415,7 @@ def handle_slash(
                 "Chưa có keyword group nào trong DB.\n"
                 "Dùng /addgroup để tạo, hoặc khởi động lại tracker để seed từ keywords.yaml."
             )
-        active_n = sum(1 for _, _, a, _ in all_groups if a)
+        active_n = sum(1 for entry in all_groups if entry[3])  # entry[3] = active
         inactive_n = len(all_groups) - active_n
         header = f"📋 Keyword groups ({active_n} đang bật"
         if inactive_n:
@@ -722,7 +731,8 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             _reply(
                 bot_token, chat_id,
                 "Cú pháp: /goiy từ_khóa\nVí dụ: /goiy lâm đồng\n\n"
-                "Bot cào cổng, gợi ý từ liên quan, bạn chọn số để hẹp dần, rồi /taogroup.",
+                "Bot cào cổng, gợi ý từ liên quan, bạn bấm nút để hẹp dần, rồi tạo group.",
+                reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
             )
             return
         _suggest_state.pop(ukey, None)  # reset phiên cũ nếu có
@@ -749,7 +759,14 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             crawler.close()
 
         if not bids:
-            _reply(bot_token, chat_id, f'Không tìm thấy gói nào cho "{seed}". Thử từ khóa khác?')
+            _reply(
+                bot_token, chat_id,
+                f'Không tìm thấy gói nào cho "{seed}". Thử từ khóa ngắn hơn?',
+                reply_markup=_kb([
+                    [_btn("🔍 Tìm trực tiếp", "search|open"), _btn("🌐 Tìm cả đóng", "search|closed")],
+                    [_btn("🏠 Menu", "menu")],
+                ]),
+            )
             return
 
         suggestions = extract_suggestions(bids, accumulated=[seed])
@@ -757,7 +774,11 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             _reply(
                 bot_token, chat_id,
                 f'Tìm thấy {len(bids)} gói nhưng kết quả quá đa dạng, không trích được từ gợi ý.\n'
-                f'Thử /tim {seed} để xem trực tiếp.',
+                f'Dùng nút bên dưới để tìm trực tiếp với từ khóa "{seed}".',
+                reply_markup=_kb([
+                    [_btn("🔍 Tìm gói mở", "search|open"), _btn("🌐 Tìm cả đóng", "search|closed")],
+                    [_btn("🏠 Menu", "menu")],
+                ]),
             )
             return
 
@@ -793,7 +814,10 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             "  /tim Công an tỉnh Lâm Đồng\n\n"
             "Thoát: /hủy"
         )
-        _reply(bot_token, chat_id, hint)
+        _reply(
+            bot_token, chat_id, hint,
+            reply_markup=_kb([[_btn("❌ Hủy", "huy")]]),
+        )
         return
 
     if cmd in ("/timtat", "/timall"):
@@ -810,6 +834,10 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                 "  /timtat Công an tỉnh Lâm Đồng\n"
                 "  /timtat camera & lâm đồng\n"
                 "  /timtat camera, cctv",
+                reply_markup=_kb([
+                    [_btn("🌐 Bấm để tìm tất cả", "search|closed")],
+                    [_btn("🏠 Menu", "menu")],
+                ]),
             )
             return
         _await_keyword.pop(ukey, None)
@@ -826,7 +854,8 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                 "Cú pháp: /timgroup Tên group\n\n"
                 "Chạy tìm kiếm ngay bằng từ khóa của group đã lưu.\n"
                 "Group tắt (/tatgroup) vẫn có thể dùng lệnh này để tra thử.\n"
-                "Xem /groups để biết danh sách.",
+                "Bấm nút hoặc xem /groups để biết danh sách:",
+                reply_markup=_groups_kb(list_all_groups_raw()),
             )
             return
         init_db()
@@ -865,20 +894,31 @@ def process_message(secrets: Secrets, msg: dict) -> None:
     if routed:
         parse_html_cmds = ("/id", "/ma", "/xem", "/lookup")
         kb: Optional[dict] = None
-        if cmd in ("/start", "/help", "/gioithieu", "/lenh", "/commands"):
-            kb = _main_menu_kb()
-        elif cmd in ("/thongke", "/dashboard"):
+        _groups_cmds = (
+            "/groups", "/keywords",
+            "/addgroup", "/removegroup", "/addkw", "/removekw",
+            "/renamegroup", "/tatgroup", "/disablegroup", "/batgroup", "/enablegroup",
+            "/taogroup", "/testkw",
+        )
+        _stats_cmds = ("/thongke", "/dashboard", "/stats")
+        _data_cmds = ("/lichsu", "/recent", "/chuagui", "/unsent", "/timhom", "/today")
+        _menu_cmds = (
+            "/start", "/help", "/gioithieu", "/lenh", "/commands",
+            "/ping", "/about", "/phienban", "/id", "/ma",
+            "/xem", "/lookup", "/xoa", "/deletebid", "/test",
+        )
+        if cmd in _groups_cmds:
+            init_db()
+            kb = _groups_kb(list_all_groups_raw())
+        elif cmd in _stats_cmds:
             kb = _kb([
                 [_btn("📜 Lịch sử", "cmd|/lichsu"), _btn("📭 Chưa gửi", "cmd|/chuagui")],
                 [_btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
             ])
-        elif cmd in ("/groups", "/keywords"):
-            init_db()
-            kb = _groups_kb(list_all_groups_raw())
-        elif cmd in ("/lichsu", "/recent"):
+        elif cmd in _data_cmds:
             kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
-        elif cmd in ("/chuagui", "/unsent"):
-            kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+        elif cmd in _menu_cmds:
+            kb = _main_menu_kb()
         _reply(
             bot_token,
             chat_id,
@@ -889,7 +929,11 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         return
 
     if cmd:
-        _reply(bot_token, chat_id, "Lệnh không rõ. Gõ /help để xem hướng dẫn.")
+        _reply(
+            bot_token, chat_id,
+            "Lệnh không rõ. Gõ /help hoặc bấm Menu để xem hướng dẫn.",
+            reply_markup=_kb([[_btn("🏠 Menu chính", "menu"), _btn("❓ Trợ giúp", "cmd|/help")]]),
+        )
         return
 
     # ── /goiy state: user gửi số để chọn gợi ý ──────────────────────────────
@@ -1013,16 +1057,23 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
         routed = handle_slash(cmd_str, secrets, chat.get("type"), chat_id=chat_id, user_id=int(uid))
         if routed:
             kb: Optional[dict] = None
-            if cmd_key in ("/thongke", "/dashboard"):
+            _cq_groups_cmds = (
+                "/groups", "/keywords",
+                "/addgroup", "/removegroup", "/addkw", "/removekw",
+                "/renamegroup", "/tatgroup", "/batgroup", "/taogroup", "/testkw",
+            )
+            if cmd_key in _cq_groups_cmds:
+                init_db()
+                kb = _groups_kb(list_all_groups_raw())
+            elif cmd_key in ("/thongke", "/dashboard", "/stats"):
                 kb = _kb([
                     [_btn("📜 Lịch sử", "cmd|/lichsu"), _btn("📭 Chưa gửi", "cmd|/chuagui")],
                     [_btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
                 ])
-            elif cmd_key in ("/groups", "/keywords"):
-                init_db()
-                kb = _groups_kb(list_all_groups_raw())
             elif cmd_key in ("/lichsu", "/recent", "/chuagui", "/unsent", "/timhom", "/today"):
                 kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+            else:
+                kb = _main_menu_kb()
             _reply(
                 token,
                 chat_id,
