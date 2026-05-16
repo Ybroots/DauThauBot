@@ -1,11 +1,15 @@
-# Nếu Railway dùng Nixpacks thay vì Dockerfile — cài dependency + chạy run_railway.py
-# Khuyến nghị: Settings → Build → Dockerfile (cần Playwright).
+# Fallback khi Railway KHONG dung Dockerfile. Uu tien: Settings → Build → Dockerfile.
+# Playwright/reCAPTCHA can Dockerfile — Nixpacks thieu Chromium.
 
 [phases.setup]
-nixPkgs = ["python312"]
+nixPkgs = ["python310", "pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "pip install --upgrade pip",
+  "pip install -r requirements.txt",
+  "pip install .",
+]
 
 [start]
 cmd = "python run_railway.py"

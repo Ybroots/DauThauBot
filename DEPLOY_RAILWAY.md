@@ -124,11 +124,13 @@ Trong **Settings → Deploy** → **Custom Start Command**:
 
 Nếu log vẫn hiện `/usr/bin/python` + `ModuleNotFoundError`: Railway đang **không** dùng Dockerfile → chuyển **Builder = Dockerfile** (mục D3) rồi redeploy.
 
-### D5. Lưu và chờ build lần đầu
+### D5. Redeploy (xóa cache build cũ)
 
 1. **Save** mọi thay đổi Settings.  
-2. Tab **Deployments** — đợi trạng thái **Success** (lần đầu build Docker Playwright có thể **5–15 phút**).  
-3. Nếu **Failed** — mở deployment → xem log lỗi (copy dòng `ERROR` cuối) để đối chiếu mục **Phần H — Gỡ lỗi**.
+2. Tab **Deployments** → menu **⋯** trên deployment mới nhất → **Redeploy** (nếu có **Clear build cache** / **Rebuild without cache** thì bật).  
+3. Mở tab **Build logs** (không phải Deploy logs): phải thấy bước `FROM mcr.microsoft.com/playwright/python` — nếu không thấy dòng này thì vẫn đang Nixpacks.  
+4. Đợi **Success** (Docker Playwright thường **5–15 phút**).  
+5. Tab **Deploy logs** — tìm `[run_railway] cwd=...` và `railway_main: scheduler + Telegram bot`.
 
 ---
 
@@ -234,7 +236,9 @@ Nếu không thấy → xem **Phần H**.
 | Mỗi lần deploy mất hết “đã gửi” | Chưa có volume hoặc `DATA_DIR` không trỏ `/data`. |
 | Bot không trả lời | Token sai; hoặc vẫn chạy **một process khác** `getUpdates` cùng token; hoặc Group Privacy / bot không vào đúng nhóm. |
 | `/tim` lỗi reCAPTCHA / timeout | Thử giảm tần suất gọi; tăng `POLL_INTERVAL_MINUTES`; kiểm tra log chi tiết; trên cloud đôi khi cần thử `PLAYWRIGHT_HEADLESS=false` (không phải lúc nào cũng khả thi trên Railway). |
-| `ModuleNotFoundError: No module named 'tracker'` | Code nằm trong `src/` — bật build **Dockerfile** (repo đã `pip install .` trong image). Hoặc Nixpacks: dùng `Procfile` có `PYTHONPATH=src`. Settings → Build → **Dockerfile**, không chỉ Nixpacks + Procfile trống. |
+| `ModuleNotFoundError: No module named 'tracker'` | Start command: **`python run_railway.py`**. Build: **Dockerfile** (không Nixpacks). Root Directory để trống. |
+| Log có `/usr/lib/python3.10` + lỗi `importlib` | Đang chạy **Nixpacks**, không phải image Docker — đổi Builder → **DockerFILE**, Redeploy **Clear build cache**. |
+| `[run_railway] THIEU package: httpx` | Build chưa `pip install -r requirements.txt` — dùng Dockerfile hoặc xem log tab **Build**. |
 | `ModuleNotFoundError` (khác) | `requirements.txt` / image thiếu package — so với repo. |
 
 ---
