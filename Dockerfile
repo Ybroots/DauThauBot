@@ -8,7 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# playwright==1.49.0 phải khớp base image — không playwright install (browser có sẵn trong image)
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "import playwright; v=playwright.__version__; print('playwright', v); assert v.startswith('1.49')"
 
 # Một lần copy app — BUILD_STAMP buộc invalidate cache khi đổi version
 COPY BUILD_STAMP run_railway.py pyproject.toml README.md ./

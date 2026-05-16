@@ -9,4 +9,5 @@ loguru>=0.7
 pytz>=2024.1
 tzdata>=2024.1
 tenacity>=8.2
-playwright>=1.40
+# Phải khớp tag image Docker (mcr.microsoft.com/playwright/python:vX.Y.Z-jammy)
+playwright==1.49.0
