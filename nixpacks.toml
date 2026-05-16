@@ -1,0 +1,11 @@
+# Nếu Railway dùng Nixpacks thay vì Dockerfile — cài dependency + chạy run_railway.py
+# Khuyến nghị: Settings → Build → Dockerfile (cần Playwright).
+
+[phases.setup]
+nixPkgs = ["python312"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python run_railway.py"

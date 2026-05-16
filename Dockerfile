@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md run_railway.py ./
 COPY config ./config
 COPY src ./src
 
@@ -20,4 +20,4 @@ ENV PYTHONPATH=/app/src
 # Volume Railway gắn tại /data (SQLite + tuỳ chọn keywords.yaml)
 ENV DATA_DIR=/data
 
-CMD ["python", "-m", "tracker.railway_main"]
+CMD ["python", "run_railway.py"]

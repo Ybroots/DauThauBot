@@ -115,12 +115,14 @@ Thứ tự ưu tiên (trong code):
 4. **Dockerfile path:** để trống hoặc `Dockerfile` nếu file nằm ở root.  
 5. **Root directory:** để trống (trừ khi repo là monorepo và code nằm thư mục con — khi đó chỉ đúng thư mục chứa `Dockerfile`).
 
-### D4. Start command (nếu có ô “Custom Start Command”)
+### D4. Start command (quan trọng — sửa nếu log báo `No module named 'tracker'`)
 
-- **Để trống** nếu bạn dùng `Dockerfile` của repo (đã có `CMD ["python", "-m", "tracker.railway_main"]`).  
-- Nếu Railway bắt buộc nhập, gõ chính xác:
+Trong **Settings → Deploy** → **Custom Start Command**:
 
-  `python -m tracker.railway_main`
+- Gõ **`python run_railway.py`** (file ở root repo), **hoặc để trống** nếu build **Dockerfile** (image đã `CMD python run_railway.py`).
+- **Không** dùng `python -m tracker.railway_main` trừ khi đã `pip install .` trong image — dễ lỗi trên Nixpacks.
+
+Nếu log vẫn hiện `/usr/bin/python` + `ModuleNotFoundError`: Railway đang **không** dùng Dockerfile → chuyển **Builder = Dockerfile** (mục D3) rồi redeploy.
 
 ### D5. Lưu và chờ build lần đầu
 

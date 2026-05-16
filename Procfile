@@ -1,1 +1,1 @@
-worker: sh -c 'PYTHONPATH=src python -m tracker.railway_main'
+worker: python run_railway.py
