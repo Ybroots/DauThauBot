@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Entry Railway: luôn chạy từ thư mục repo, thêm src/ vào PYTHONPATH."""
+"""Entry Railway — bootstrap đầy đủ; scheduler UTC tại đây (không gọi scheduler.main cũ)."""
 
 from __future__ import annotations
 
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
+
+# v3-inline-scheduler-utc — log phải thấy chuỗi này sau deploy
+RUNTIME_REV = "v3-inline-scheduler-utc"
 
 _ROOT = Path(__file__).resolve().parent
 _SRC = _ROOT / "src"
@@ -16,42 +20,82 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
-def _preflight() -> None:
-    """In chẩn đoán ra stderr (Railway Logs) trước khi import tracker."""
-    print(f"[run_railway] cwd={os.getcwd()}", file=sys.stderr, flush=True)
-    print(f"[run_railway] python={sys.executable}", file=sys.stderr, flush=True)
-    print(f"[run_railway] src_exists={_SRC.is_dir()}", file=sys.stderr, flush=True)
-    tracker_pkg = _SRC / "tracker"
-    print(f"[run_railway] tracker_pkg={tracker_pkg.is_dir()}", file=sys.stderr, flush=True)
-    for mod in ("httpx", "pydantic", "pydantic_settings", "yaml", "apscheduler", "loguru", "tzdata"):
-        try:
-            __import__(mod)
-        except ImportError as e:
-            print(f"[run_railway] THIEU package: {mod} — {e}", file=sys.stderr, flush=True)
-            print(
-                "[run_railway] Build phai cai requirements.txt hoac dung Dockerfile.",
-                file=sys.stderr,
-                flush=True,
-            )
-            sys.exit(1)
+def _configure_logging(level: str) -> None:
+    from loguru import logger
+
+    logger.remove()
+    use_stdout = bool(os.environ.get("RAILWAY_ENVIRONMENT", "").strip()) or os.environ.get(
+        "LOG_TO_STDOUT", ""
+    ).lower() in ("1", "true", "yes")
+    if use_stdout:
+        logger.add(
+            sys.stderr,
+            level=level.upper(),
+            colorize=False,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        )
+    else:
+        from tracker.__main__ import _setup_logging
+
+        _setup_logging(level)
+
+
+def _run_scheduler_utc(secrets) -> None:
+    """Không import scheduler.main — tránh BlockingScheduler(timezone=TZ) trên image cache cũ."""
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+    from loguru import logger
+
+    from tracker.scheduler import safe_run
+
+    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler.add_job(
+        safe_run,
+        IntervalTrigger(
+            minutes=secrets.poll_interval_minutes,
+            jitter=secrets.poll_jitter_seconds,
+        ),
+        id="crawl_job",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    logger.info(
+        "Scheduler started: interval={}m ±{}s (tz=UTC), quiet={}-{} (VN) rev={}",
+        secrets.poll_interval_minutes,
+        secrets.poll_jitter_seconds,
+        secrets.quiet_hours_start,
+        secrets.quiet_hours_end,
+        RUNTIME_REV,
+    )
+    safe_run()
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Scheduler stopped")
+
+
+def main() -> None:
+    from loguru import logger
+
+    from tracker import bot_commands
+    from tracker.config import Secrets
+
+    secrets = Secrets()
+    _configure_logging(secrets.log_level)
+
+    print(f"[run_railway] {RUNTIME_REV} cwd={os.getcwd()}", file=sys.stderr, flush=True)
+
+    logger.info("railway_main (inline): bot + scheduler rev={}", RUNTIME_REV)
+    bot_thread = threading.Thread(target=bot_commands.main, daemon=True, name="telegram_bot")
+    bot_thread.start()
+    logger.info("Telegram bot thread started (getUpdates long polling)")
+
+    _run_scheduler_utc(secrets)
 
 
 if __name__ == "__main__":
     try:
-        _preflight()
-        from tracker import scheduler as _sched  # noqa: E402
-
-        if getattr(_sched, "SCHEDULER_TZ", None) != "UTC":
-            print(
-                "[run_railway] LOI: scheduler.py chua cap nhat (can SCHEDULER_TZ=UTC). "
-                "Railway: Redeploy + Clear build cache.",
-                file=sys.stderr,
-                flush=True,
-            )
-            sys.exit(1)
-
-        from tracker.railway_main import main  # noqa: E402
-
         main()
     except Exception:
         traceback.print_exc()

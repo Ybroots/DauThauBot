@@ -9,7 +9,6 @@ import threading
 from loguru import logger
 
 from . import bot_commands
-from . import scheduler as sched_module
 from .config import Secrets
 
 # Đổi khi deploy quan trọng — log giúp biết Railway đã chạy image mới
@@ -42,18 +41,41 @@ def main() -> None:
 
         _setup_logging(secrets.log_level)
 
-    sched_tz = getattr(sched_module, "SCHEDULER_TZ", None)
-    if sched_tz != "UTC":
-        raise RuntimeError(
-            f"scheduler.py cũ (SCHEDULER_TZ={sched_tz!r}). Redeploy với Clear build cache."
-        )
-
     logger.info("railway_main: scheduler + Telegram bot (1 process) rev={}", DEPLOY_REV)
     bot_thread = threading.Thread(target=bot_commands.main, daemon=True, name="telegram_bot")
     bot_thread.start()
     logger.info("Telegram bot thread started (getUpdates long polling)")
 
-    sched_module.main(secrets=secrets, skip_setup_logging=use_stdout)
+    # UTC trực tiếp — không gọi scheduler.main (tránh timezone=TZ / zoneinfo trên Docker)
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    from .scheduler import safe_run
+
+    scheduler = BlockingScheduler(timezone="UTC")
+    scheduler.add_job(
+        safe_run,
+        IntervalTrigger(
+            minutes=secrets.poll_interval_minutes,
+            jitter=secrets.poll_jitter_seconds,
+        ),
+        id="crawl_job",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    logger.info(
+        "Scheduler started: interval={}m ±{}s (tz=UTC), quiet={}-{} (VN)",
+        secrets.poll_interval_minutes,
+        secrets.poll_jitter_seconds,
+        secrets.quiet_hours_start,
+        secrets.quiet_hours_end,
+    )
+    safe_run()
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Scheduler stopped")
 
 
 if __name__ == "__main__":
