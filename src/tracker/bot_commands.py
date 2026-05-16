@@ -11,9 +11,14 @@ from loguru import logger
 from tenacity import RetryError
 
 from .config import Secrets, load_keywords_yaml
-from .crawler import BlockedException
+from .crawler import BlockedException, MuasamcongCrawler
 from .filter import explain_match, match_bid
 from .interactive_search import parse_keyword_phrases, run_interactive_keyword_search
+from .keyword_suggest import (
+    build_suggest_reply,
+    extract_suggestions,
+    filter_bids_by_terms,
+)
 from .models import Bid
 from .storage import (
     add_group,
@@ -39,6 +44,10 @@ POLL_TIMEOUT = 30
 # Đợi user gửi từ khóa trong tin tiếp theo (scope theo Chat+User để không lẫn nhau trong nhóm)
 _await_keyword: dict[str, bool] = {}
 _last_search_ts: dict[str, float] = {}
+
+# State cho luồng /goiy — gợi ý từ khóa có hướng dẫn
+# { state_key: { "accumulated": [str], "bids": [Bid], "suggestions": [(str,int)] } }
+_suggest_state: dict[str, dict] = {}
 
 
 def _state_key(chat_id: str | int, user_id: int) -> str:
@@ -199,6 +208,9 @@ def HELP_VI() -> str:
         "Chat riêng: gõ một dòng từ khóa (VD: camera) là tra luôn, không cần /tim.\n"
         "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true để gõ thẳng như chat riêng.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
+        "Gợi ý & tạo keyword group từ dữ liệu thực:\n"
+        "• /goiy lâm đồng — bot cào cổng, gợi ý từ liên quan\n"
+        "  → chọn số để hẹp dần → /taogroup để lưu\n\n"
         "Quản lý keyword groups (AND/OR logic):\n"
         "• /groups — xem tất cả groups\n"
         "• /addgroup Tên | all | kw1, kw2 — tạo group AND\n"
@@ -215,6 +227,7 @@ def COMMAND_LIST_VI() -> str:
     return (
         "Lệnh bot DauThauBot:\n"
         "• /tim — tra TBMT theo từ khóa (xem /help)\n"
+        "• /goiy từ_khóa — gợi ý từ liên quan, hẹp dần → /taogroup\n"
         "• /groups — xem keyword groups (AND/OR logic)\n"
         "• /addgroup Tên | all|any | kw1, kw2 — tạo group mới\n"
         "• /removegroup Tên — xóa group\n"
@@ -370,6 +383,34 @@ def handle_slash(
         cfg = load_groups_from_db()
         return explain_match(bid, cfg)
 
+    if cmd == "/taogroup":
+        ukey = _state_key(chat_id, user_id)
+        state = _suggest_state.pop(ukey, None)
+        if not state:
+            return (
+                "Không có phiên /goiy nào đang mở.\n"
+                "Dùng /goiy từ_khóa để bắt đầu gợi ý."
+            )
+        accumulated = state["accumulated"]
+        if len(accumulated) < 1:
+            return "Chưa chọn từ khóa nào để tạo group."
+        name = " ".join(accumulated[:3])  # tên tự sinh từ 3 từ đầu
+        init_db()
+        ok = add_group(name, "all", accumulated)
+        if not ok:
+            # Tên bị trùng → thêm hậu tố
+            import time as _time
+            name = f"{name} {int(_time.time()) % 10000}"
+            ok = add_group(name, "all", accumulated)
+        if not ok:
+            return "Lỗi khi tạo group. Thử /addgroup thủ công."
+        kw_str = " + ".join(f'"{k}"' for k in accumulated)
+        return (
+            f'✅ Đã tạo group "{name}" [TẤT CẢ — AND]\n'
+            f"   Keywords: {kw_str}\n\n"
+            f"Dùng /groups để xem, /addkw để thêm từ."
+        )
+
     if cmd == "/stats":
         init_db()
         n = count_sent_since(7)
@@ -444,7 +485,61 @@ def process_message(secrets: Secrets, msg: dict) -> None:
 
     if cmd in ("/huy", "/hủy", "/cancel"):
         _await_keyword.pop(ukey, None)
-        _reply(bot_token, chat_id, "Đã hủy bước nhập từ khóa.")
+        _suggest_state.pop(ukey, None)
+        _reply(bot_token, chat_id, "Đã hủy.")
+        return
+
+    if cmd in ("/goiy", "/suggest"):
+        seed = rest.strip()
+        if not seed:
+            _reply(
+                bot_token, chat_id,
+                "Cú pháp: /goiy từ_khóa\nVí dụ: /goiy lâm đồng\n\n"
+                "Bot cào cổng, gợi ý từ liên quan, bạn chọn số để hẹp dần, rồi /taogroup.",
+            )
+            return
+        _suggest_state.pop(ukey, None)  # reset phiên cũ nếu có
+        _reply(
+            bot_token, chat_id,
+            f'🔍 Đang cào cổng với từ khóa "{seed}" (Playwright ~30–90s)…',
+        )
+        crawler = MuasamcongCrawler(
+            page_size=50,
+            use_playwright=secrets.use_playwright,
+            playwright_headless=secrets.playwright_headless,
+            playwright_channel=secrets.playwright_channel,
+        )
+        try:
+            bids = crawler.fetch_recent_bids(max_pages=1, server_keyword=seed)
+        except BlockedException as e:
+            _reply(bot_token, chat_id, f"Cổng tạm chặn (HTTP {e.status_code}). Thử lại sau.")
+            return
+        except Exception:
+            logger.exception("/goiy crawler error")
+            _reply(bot_token, chat_id, "Lỗi khi cào cổng. Xem logs/ để biết chi tiết.")
+            return
+        finally:
+            crawler.close()
+
+        if not bids:
+            _reply(bot_token, chat_id, f'Không tìm thấy gói nào cho "{seed}". Thử từ khóa khác?')
+            return
+
+        suggestions = extract_suggestions(bids, accumulated=[seed])
+        if not suggestions:
+            _reply(
+                bot_token, chat_id,
+                f'Tìm thấy {len(bids)} gói nhưng kết quả quá đa dạng, không trích được từ gợi ý.\n'
+                f'Thử /tim {seed} để xem trực tiếp.',
+            )
+            return
+
+        _suggest_state[ukey] = {
+            "accumulated": [seed],
+            "bids": bids,
+            "suggestions": suggestions,
+        }
+        _reply(bot_token, chat_id, build_suggest_reply(bids, [seed], suggestions))
         return
 
     if cmd in ("/tim", "/timkiem", "/search"):
@@ -477,6 +572,61 @@ def process_message(secrets: Secrets, msg: dict) -> None:
     if cmd:
         _reply(bot_token, chat_id, "Lệnh không rõ. Gõ /help để xem hướng dẫn.")
         return
+
+    # ── /goiy state: user gửi số để chọn gợi ý ──────────────────────────────
+    if ukey in _suggest_state:
+        stripped_text = text.strip()
+        if stripped_text.isdigit():
+            idx = int(stripped_text) - 1
+            state = _suggest_state[ukey]
+            suggestions = state["suggestions"]
+            if idx < 0 or idx >= len(suggestions):
+                _reply(
+                    bot_token, chat_id,
+                    f"Số không hợp lệ. Chọn từ 1 đến {len(suggestions)}, "
+                    "hoặc /taogroup để tạo group, /hủy để thoát.",
+                )
+                return
+            chosen_term, _ = suggestions[idx]
+            state["accumulated"].append(chosen_term)
+            accumulated = state["accumulated"]
+
+            # Lọc bids client-side với tất cả từ đã chọn
+            filtered = filter_bids_by_terms(state["bids"], accumulated)
+
+            if not filtered:
+                # Không còn gói nào khớp → gợi ý tạo group ngay
+                kw_str = " + ".join(f'"{k}"' for k in accumulated)
+                _reply(
+                    bot_token, chat_id,
+                    f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\n'
+                    f"Không còn gói nào khớp đủ {len(accumulated)} điều kiện trong dữ liệu đã cào.\n"
+                    "Gõ /taogroup để tạo group AND ngay, hoặc /hủy.",
+                )
+                state["suggestions"] = []
+                return
+
+            new_suggestions = extract_suggestions(filtered, accumulated=accumulated)
+            state["bids"] = filtered
+            state["suggestions"] = new_suggestions
+
+            if not new_suggestions:
+                kw_str = " + ".join(f'"{k}"' for k in accumulated)
+                _reply(
+                    bot_token, chat_id,
+                    f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\n'
+                    f"Còn {len(filtered)} gói khớp. Không còn từ để gợi thêm.\n"
+                    "Gõ /taogroup để tạo group AND, hoặc /hủy.",
+                )
+                return
+
+            reply = (
+                f'✅ Thêm "{chosen_term}". '
+                + build_suggest_reply(filtered, accumulated, new_suggestions)
+            )
+            _reply(bot_token, chat_id, reply)
+            return
+        # Không phải số → bỏ qua suggest state, xử lý bình thường bên dưới
 
     if _await_keyword.get(ukey):
         phrases = parse_keyword_phrases(text.strip())
