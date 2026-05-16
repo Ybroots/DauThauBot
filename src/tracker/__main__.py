@@ -1,16 +1,60 @@
 from __future__ import annotations
 
+import random
+import time
+
 from loguru import logger
 
 from .config import PROJECT_ROOT, Secrets, load_keywords
 from .crawler import BlockedException, MuasamcongCrawler
 from .filter import matches_keywords
 from .formatter import format_bid_message
+from .models import Bid
 from .storage import init_db, mark_seen, was_sent
 from .telegram import send_to_chats
 
 _consecutive_empty = 0
 _consecutive_blocks = 0
+
+
+def _tracker_keyword_strings(keywords_cfg) -> list[str]:
+    return [str(k).strip() for k in keywords_cfg.keywords if k and str(k).strip()]
+
+
+def _collect_bids_crawl(
+    crawler: MuasamcongCrawler,
+    secrets: Secrets,
+    keywords_cfg,
+) -> list[Bid]:
+    """TBMT: luồng mới toàn cổng, hoặc (mặc định) tra từng từ khóa phía server rồi gộp + dedupe."""
+    kws = _tracker_keyword_strings(keywords_cfg)
+    if not kws or not secrets.crawl_per_keyword:
+        logger.info("Cào: một luồng TBMT mới (lọc từ khóa trên máy nếu có)")
+        return crawler.fetch_recent_bids(max_pages=secrets.crawl_max_pages)
+
+    logger.info(
+        "Cào: {} từ khóa phía server × tối đa {} trang/gộp dedupe theo mã TBMT",
+        len(kws),
+        secrets.crawl_max_pages,
+    )
+    merged: dict[str, Bid] = {}
+    for i, kw in enumerate(kws):
+        if i > 0 and secrets.crawl_keyword_gap_max_seconds > 0:
+            lo = float(secrets.crawl_keyword_gap_min_seconds)
+            hi = float(secrets.crawl_keyword_gap_max_seconds)
+            gap = random.uniform(lo, hi)
+            logger.info("Nghỉ {:.1f}s trước từ khóa tiếp theo…", gap)
+            time.sleep(gap)
+        logger.info("Từ khóa [{}/{}]: {!r}", i + 1, len(kws), kw)
+        chunk = crawler.fetch_recent_bids(
+            max_pages=secrets.crawl_max_pages,
+            server_keyword=kw,
+        )
+        for b in chunk:
+            merged[b.tbmt_code] = b
+    out = list(merged.values())
+    logger.info("Gộp xong: {} gói (sau dedupe)", len(out))
+    return out
 
 
 def _setup_logging(level: str) -> None:
@@ -56,13 +100,13 @@ def run_once() -> None:
     sent_total = 0
     try:
         logger.info(
-            "fetch_start (max {} pages × {} = ~{} bids)",
-            secrets.crawl_max_pages,
+            "fetch_start page_size={} crawl_max_pages={} (~{} kết quả mỗi nguồn)",
             secrets.crawl_page_size,
+            secrets.crawl_max_pages,
             secrets.crawl_max_bids,
         )
-        bids = crawler.fetch_recent_bids(max_pages=secrets.crawl_max_pages)
-        logger.info("Fetched {} bids", len(bids))
+        bids = _collect_bids_crawl(crawler, secrets, keywords_cfg)
+        logger.info("Fetched {} bids (sau gộp)", len(bids))
 
         if len(bids) == 0:
             _consecutive_empty += 1

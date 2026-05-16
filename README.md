@@ -77,11 +77,16 @@ Tùy chọn `.env`: `INTERACTIVE_SEARCH_MAX_MESSAGES`, `INTERACTIVE_SEARCH_COOLD
 
 ## Tăng số gói cào mỗi lần
 
+Mặc định **cào theo từng từ khóa phía server** (`CRAWL_PER_KEYWORD=true` khi `keywords.yaml` có từ): mỗi từ = một chuỗi `smart/search` (tối đa `CRAWL_MAX_PAGES` trang), kết quả **gộp và loại trùng theo mã TBMT**. Cách này tìm đúng hướng ES hơn là chỉ lấy vài trang “TBMT mới nhất” rồi lọc từ khóa trên máy.
+
 Trong `.env`:
 
 ```env
 CRAWL_PAGE_SIZE=50    # 10–50 (giống trang web)
-CRAWL_MAX_PAGES=5     # 1–10 → tối đa ~250 gói/lần
+CRAWL_MAX_PAGES=5     # 1–10 trang cho mỗi từ khóa (hoặc cho luồng duy nhất nếu tắt per-keyword)
+CRAWL_PER_KEYWORD=true
+CRAWL_KEYWORD_GAP_MIN_SECONDS=6
+CRAWL_KEYWORD_GAP_MAX_SECONDS=14
 ```
 
 | Cấu hình | Gói/lần | Ghi chú |
@@ -89,6 +94,10 @@ CRAWL_MAX_PAGES=5     # 1–10 → tối đa ~250 gói/lần
 | `2` × `50` (mặc định) | ~100 | An toàn, đủ cho chu kỳ 45 phút |
 | `5` × `50` | ~250 | Cân bằng |
 | `10` × `50` | ~500 | Dễ bị rate-limit; chạy chậm hơn (~1 phút/lần) |
+
+Nhiều từ khóa ⇒ nhiều lần Playwright + reCAPTCHA: giảm `CRAWL_MAX_PAGES` hoặc tăng `POLL_INTERVAL_MINUTES` nếu hay bị chặn.
+
+`CRAWL_PER_KEYWORD=false` — quay lại một luồng TBMT mới, lọc từ khóa chỉ trên máy (nhẹ hơn, dễ miss gói).
 
 ## Ghi chú kỹ thuật
 

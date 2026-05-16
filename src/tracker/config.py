@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Thư mục gốc dự án — không phụ thuộc cwd khi chạy module
@@ -35,6 +35,12 @@ class Secrets(BaseSettings):
     # Số gói/lần ≈ crawl_max_pages × crawl_page_size (mặc định 2×50=100)
     crawl_page_size: int = 50
     crawl_max_pages: int = 2
+    # true + có keywords.yaml: mỗi từ khóa gọi smart/search riêng (ES), gộp + dedupe theo mã TBMT.
+    # false: chỉ một luồng “TBMT mới” như cũ (lọc từ khóa trên máy).
+    crawl_per_keyword: bool = True
+    # Nghỉ ngẫu nhiên giữa hai từ khóa (giảm 429) — chỉ khi crawl_per_keyword.
+    crawl_keyword_gap_min_seconds: int = 6
+    crawl_keyword_gap_max_seconds: int = 14
 
     @field_validator("playwright_channel", mode="before")
     @classmethod
@@ -55,6 +61,22 @@ class Secrets(BaseSettings):
     @classmethod
     def _clamp_max_pages(cls, v: int) -> int:
         return max(1, min(v, 10))
+
+    @field_validator("crawl_keyword_gap_min_seconds")
+    @classmethod
+    def _clamp_kw_gap_min(cls, v: int) -> int:
+        return max(0, min(int(v), 300))
+
+    @field_validator("crawl_keyword_gap_max_seconds")
+    @classmethod
+    def _clamp_kw_gap_max(cls, v: int) -> int:
+        return max(0, min(int(v), 600))
+
+    @model_validator(mode="after")
+    def _keyword_gap_max_ge_min(self) -> Secrets:
+        if self.crawl_keyword_gap_max_seconds < self.crawl_keyword_gap_min_seconds:
+            self.crawl_keyword_gap_max_seconds = self.crawl_keyword_gap_min_seconds
+        return self
 
     @property
     def crawl_max_bids(self) -> int:
