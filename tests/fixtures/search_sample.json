@@ -1,0 +1,29 @@
+{
+  "page": {
+    "content": [
+      {
+        "type": "es-notify-contractor",
+        "notifyNo": "IB2500579539",
+        "notifyVersion": "00",
+        "notifyNoStand": "IB2500579539-00",
+        "bidName": ["Mua sắm camera giám sát tại Lâm Đồng"],
+        "investorName": "UBND tỉnh Lâm Đồng",
+        "procuringEntityName": "Sở Tài chính Lâm Đồng",
+        "publicDate": "2025-12-10T03:53:00.000Z",
+        "bidCloseDate": "2025-12-19T03:00:00.000Z",
+        "investField": ["HH"],
+        "locations": [{"districtName": "Phường Long An", "provName": "Tỉnh Tây Ninh"}],
+        "isInternet": 1,
+        "bidPrice": 500000000,
+        "id": "47522bd5-c130-4d77-a41e-a6eb4ff15141",
+        "notifyId": "47522bd5-c130-4d77-a41e-a6eb4ff15141",
+        "stepCode": "notify-contractor-step-1-tbmt",
+        "processApply": "LDT",
+        "bidMode": "1_MTHS",
+        "bidForm": "DTRR",
+        "planNo": "PL2500003498"
+      }
+    ],
+    "totalElements": 1
+  }
+}

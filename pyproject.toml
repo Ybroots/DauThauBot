@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "muasamcong-tracker"
+version = "0.1.0"
+description = "Cào TBMT muasamcong.mpi.gov.vn và gửi Telegram"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx[http2]>=0.27.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "apscheduler>=3.10",
+    "loguru>=0.7",
+    "pytz>=2024.1",
+    "tenacity>=8.2",
+]
+
+[project.optional-dependencies]
+playwright = ["playwright>=1.40"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.scripts]
+muasamcong-tracker = "tracker.scheduler:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tracker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
