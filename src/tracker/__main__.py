@@ -18,15 +18,37 @@ _consecutive_blocks = 0
 
 
 def _tracker_keyword_strings(keywords_cfg) -> list[str]:
-    """Extract all unique keywords across all groups for server-side ES queries."""
+    """Trích xuất từ khóa để gửi lên ES server-side.
+
+    Chiến lược giảm số vòng Playwright và tránh phrase-match quá chặt:
+    • AND group (require=all): chỉ lấy TỪ KHÓA ĐẦU TIÊN của mỗi group để query ES —
+      client-side match_bid() kiểm tra đủ điều kiện AND sau khi gộp kết quả.
+      Lý do: querying cả N từ = N vòng Playwright; chỉ cần 1 từ "mồi" để lấy candidates.
+    • OR group (require=any): lấy TẤT CẢ từ khóa vì mỗi từ có thể match bộ gói khác nhau.
+    • Keyword từ ≥ 3 từ: cắt xuống còn 2 từ đầu — ES matchType all-1 với cụm dài
+      rất chặt (phải có đủ từng chữ), truncate giúp ES trả về rộng hơn;
+      match_bid() vẫn kiểm tra cụm đầy đủ phía client.
+    """
     seen: set[str] = set()
     out: list[str] = []
     for group in keywords_cfg.groups:
-        for k in group.keywords:
+        if group.require == "all":
+            # AND group: chỉ cần 1 keyword để kéo candidates từ ES
+            candidates = [group.keywords[0]] if group.keywords else []
+        else:
+            # OR group: cần query từng keyword riêng để phủ đủ
+            candidates = group.keywords
+
+        for k in candidates:
             k = str(k).strip()
-            if k and k not in seen:
-                out.append(k)
-                seen.add(k)
+            if not k:
+                continue
+            # Cắt phrase dài → 2 từ đầu để ES không bị phrase-match quá chặt
+            words = k.split()
+            es_kw = " ".join(words[:2]) if len(words) > 2 else k
+            if es_kw not in seen:
+                out.append(es_kw)
+                seen.add(es_kw)
     return out
 
 
