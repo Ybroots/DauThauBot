@@ -100,8 +100,34 @@ def _open_tbmt_filters() -> list[dict[str, Any]]:
     ]
 
 
-def build_tbmt_payload(page_number: int = 0, page_size: int = 50) -> list[dict[str, Any]]:
-    """TBMT mới, chưa đóng — không lọc từ server (cron)."""
+def _all_tbmt_filters() -> list[dict[str, Any]]:
+    """Tất cả TBMT — không lọc theo ngày đóng thầu (dùng cho /timtat)."""
+    return [
+        {
+            "fieldName": "type",
+            "searchType": "in",
+            "fieldValues": ["es-notify-contractor"],
+        },
+        {
+            "fieldName": "caseKHKQ",
+            "searchType": "not_in",
+            "fieldValues": ["1"],
+        },
+    ]
+
+
+def build_tbmt_payload(
+    page_number: int = 0,
+    page_size: int = 50,
+    *,
+    open_only: bool = True,
+) -> list[dict[str, Any]]:
+    """TBMT mới — không lọc từ server (cron).
+
+    open_only=True (mặc định): chỉ gói chưa đóng thầu.
+    open_only=False: tất cả gói kể cả đã đóng.
+    """
+    filters = _open_tbmt_filters() if open_only else _all_tbmt_filters()
     return [
         {
             "pageSize": page_size,
@@ -112,7 +138,7 @@ def build_tbmt_payload(page_number: int = 0, page_size: int = 50) -> list[dict[s
                     "keyWord": "",
                     "matchType": "all-1",
                     "matchFields": ["notifyNo", "bidName"],
-                    "filters": _open_tbmt_filters(),
+                    "filters": filters,
                 }
             ],
         }
@@ -126,8 +152,13 @@ def build_tbmt_keyword_payload(
     *,
     match_type: str = "all-1",
     include_investor_fields: bool = True,
+    open_only: bool = True,
 ) -> list[dict[str, Any]]:
-    """Tra TBMT theo từ khóa — mặc định gồm cả chủ đầu tư/BMT (giống cổng khi tích tìm theo cơ quan)."""
+    """Tra TBMT theo từ khóa — mặc định gồm cả chủ đầu tư/BMT (giống cổng khi tích tìm theo cơ quan).
+
+    open_only=True  → chỉ gói chưa đóng thầu (mặc định, dùng cho cron + /tim)
+    open_only=False → tất cả gói kể cả đã đóng (dùng cho /timtat)
+    """
     kw = (keyword or "").strip()
     fields: list[str] = ["notifyNo", "bidName"]
     if include_investor_fields:
@@ -139,6 +170,7 @@ def build_tbmt_keyword_payload(
                 "procuringEntityCode",
             ]
         )
+    filters = _open_tbmt_filters() if open_only else _all_tbmt_filters()
     return [
         {
             "pageSize": page_size,
@@ -149,7 +181,7 @@ def build_tbmt_keyword_payload(
                     "keyWord": kw,
                     "matchType": match_type,
                     "matchFields": fields,
-                    "filters": _open_tbmt_filters(),
+                    "filters": filters,
                 }
             ],
         }
@@ -264,6 +296,7 @@ class MuasamcongCrawler:
         *,
         max_pages_cap: int = 10,
         server_keyword: Optional[str] = None,
+        open_only: bool = True,
     ) -> list:
         from .models import Bid
 
@@ -283,7 +316,7 @@ class MuasamcongCrawler:
                     page + 1,
                     max_pages,
                 )
-                page_bids = self._fetch_page(page, server_keyword=sk)
+                page_bids = self._fetch_page(page, server_keyword=sk, open_only=open_only)
                 if not page_bids:
                     break
                 bids.extend(page_bids)
@@ -304,7 +337,13 @@ class MuasamcongCrawler:
         logger.info("fetch_done: {} bids", len(bids))
         return bids
 
-    def _fetch_page(self, page: int, server_keyword: Optional[str] = None) -> list:
+    def _fetch_page(
+        self,
+        page: int,
+        server_keyword: Optional[str] = None,
+        *,
+        open_only: bool = True,
+    ) -> list:
         from .models import Bid
 
         if server_keyword:
@@ -312,9 +351,14 @@ class MuasamcongCrawler:
                 page_number=page,
                 page_size=self.page_size,
                 keyword=server_keyword,
+                open_only=open_only,
             )
         else:
-            payload = build_tbmt_payload(page_number=page, page_size=self.page_size)
+            payload = build_tbmt_payload(
+                page_number=page,
+                page_size=self.page_size,
+                open_only=open_only,
+            )
         data = self._search(payload)
         if isinstance(data, (int, float)):
             raise BlockedException(429)

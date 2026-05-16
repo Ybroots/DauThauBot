@@ -137,6 +137,7 @@ def _execute_search(
     chat_scope_key: str,
     *,
     mode: str = "any",
+    include_closed: bool = False,
 ) -> None:
     phrases = [p for p in phrases if p.strip()]
     if not phrases:
@@ -151,10 +152,11 @@ def _execute_search(
         )
         return
     mode_note = " [AND — tất cả phải khớp]" if mode == "all" else ""
+    scope_note = " [tất cả — kể cả đã đóng thầu]" if include_closed else ""
     _reply(
         secrets.telegram_bot_token,
         target_chat_id,
-        f"Đang tra trên Muasamcong{mode_note} (Playwright có thể mất 30–90 giây), vui lòng chờ…",
+        f"Đang tra trên Muasamcong{mode_note}{scope_note} (Playwright có thể mất 30–90 giây), vui lòng chờ…",
     )
     try:
         sent, total, summary = run_interactive_keyword_search(
@@ -162,6 +164,7 @@ def _execute_search(
             phrases,
             target_chat_id=target_chat_id,
             mode=mode,
+            include_closed=include_closed,
         )
         logger.info(
             "interactive_search done chat={} sent={} matched={}",
@@ -206,11 +209,15 @@ def HELP_VI() -> str:
     return (
         "Luồng cron: tracker trên máy + keyword groups trong DB.\n\n"
         "Tra nhanh — một tin là bot chạy:\n"
-        "• /tim camera                    — 1 từ khóa\n"
+        "• /tim camera                    — 1 từ khóa (chỉ gói đang mở thầu)\n"
         "• /tim camera | cctv             — OR: bất kỳ khớp\n"
         "• /tim camera & lâm đồng        — AND: tất cả phải khớp\n"
         "• /tim Công an tỉnh Lâm Đồng    — tìm theo tên cơ quan\n"
         "• /tim camera & lâm đồng & giám sát — AND 3 điều kiện\n\n"
+        "Tìm kể cả gói đã đóng thầu:\n"
+        "• /timtat Công an tỉnh Lâm Đồng — tìm tất cả (mở + đóng)\n"
+        "• /timtat camera & lâm đồng     — AND mode, bao gồm đã đóng\n"
+        "  Dùng /timtat khi /tim trả về ít kết quả vì thiếu gói mở.\n\n"
         "Chat riêng: gõ thẳng từ khóa (không cần /tim). Hỗ trợ & để AND.\n"
         "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
@@ -232,7 +239,8 @@ def HELP_VI() -> str:
 def COMMAND_LIST_VI() -> str:
     return (
         "Lệnh bot DauThauBot:\n"
-        "• /tim — tra TBMT theo từ khóa (xem /help)\n"
+        "• /tim — tra TBMT theo từ khóa (chỉ gói đang mở thầu)\n"
+        "• /timtat — tra TBMT kể cả gói đã đóng thầu\n"
         "• /goiy từ_khóa — gợi ý từ liên quan, hẹp dần → /taogroup\n"
         "• /groups — xem keyword groups (AND/OR logic)\n"
         "• /addgroup Tên | all|any | kw1, kw2 — tạo group mới\n"
@@ -568,6 +576,26 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             "Thoát: /hủy"
         )
         _reply(bot_token, chat_id, hint)
+        return
+
+    if cmd in ("/timtat", "/timall"):
+        # Tìm tất cả TBMT kể cả đã đóng thầu — giải quyết vấn đề tìm tên cơ quan cụ thể
+        phrases, search_mode = parse_search_query(rest)
+        if not phrases:
+            _reply(
+                bot_token,
+                chat_id,
+                "Cú pháp: /timtat từ_khóa\n\n"
+                "Giống /tim nhưng tìm cả gói đã đóng thầu, hữu ích khi tên cơ quan\n"
+                "không còn gói mở thầu nào hiện tại.\n\n"
+                "Ví dụ:\n"
+                "  /timtat Công an tỉnh Lâm Đồng\n"
+                "  /timtat camera & lâm đồng\n"
+                "  /timtat camera, cctv",
+            )
+            return
+        _await_keyword.pop(ukey, None)
+        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode, include_closed=True)
         return
 
     routed = handle_slash(

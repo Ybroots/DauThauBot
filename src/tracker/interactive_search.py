@@ -50,11 +50,14 @@ def run_interactive_keyword_search(
     *,
     target_chat_id: str | int,
     mode: str = "any",
+    include_closed: bool = False,
 ) -> tuple[int, int, str]:
     """Cào theo crawl_max_pages của .env; gửi tối đa N tin HTML tới một chat.
 
-    mode="any"  → OR: bid khớp ít nhất 1 phrase (hành vi mặc định)
-    mode="all"  → AND: bid phải chứa TẤT CẢ phrases mới được gửi
+    mode="any"        → OR: bid khớp ít nhất 1 phrase (hành vi mặc định)
+    mode="all"        → AND: bid phải chứa TẤT CẢ phrases mới được gửi
+    include_closed    → True: tìm cả gói đã đóng thầu (/timtat)
+                        False: chỉ gói còn mở (/tim, mặc định)
 
     Chiến lược ES:
     • OR mode:  query TẤT CẢ phrases lên ES (union), match_bid lọc OR client-side.
@@ -90,6 +93,7 @@ def run_interactive_keyword_search(
                 uniq.append(s)
 
         mode_label = "AND (tất cả phải khớp)" if require == "all" else "OR (bất kỳ khớp)"
+        scope_label = "tất cả (kể cả đã đóng thầu)" if include_closed else "đang mở thầu"
         logger.info(
             "interactive_fetch mode={} ({} pages × {}) per phrase, phrases={}",
             require,
@@ -100,11 +104,13 @@ def run_interactive_keyword_search(
 
         # Query từng phrase lên ES — lấy UNION để có đủ candidates
         # Client-side match_bid() sẽ áp dụng AND/OR logic chính xác sau đó
+        open_only = not include_closed
         by_code: dict[str, Bid] = {}
         for phrase in uniq:
             part = crawler.fetch_recent_bids(
                 max_pages=secrets.interactive_fetch_max_pages,
                 server_keyword=phrase,
+                open_only=open_only,
             )
             for b in part:
                 by_code.setdefault(b.tbmt_code, b)
@@ -138,13 +144,21 @@ def run_interactive_keyword_search(
             if require == "all" else ""
         )
 
+        closed_note = " (bao gồm gói đã đóng thầu)" if include_closed else ""
         if total == 0:
+            no_result_hint = (
+                "\nNếu tra theo tên cơ quan, thử cụm ngắn hơn (vd. Lâm Đồng, Công an). "
+            )
+            if not include_closed:
+                no_result_hint += (
+                    "Nếu trên cổng có nhưng ở mục đã đóng thầu/rút thì bot sẽ không liệt kê — "
+                    "thử /timtat để tìm cả gói đã đóng. "
+                )
+            no_result_hint += "Có thể tăng CRAWL_MAX_PAGES hoặc INTERACTIVE_CRAWL_MAX_PAGES trong .env."
             summary = (
-                f"Không thấy gói TBMT nào khớp [{mode_label}] trong các trang đã tìm."
+                f"Không thấy gói TBMT nào khớp [{mode_label}]{closed_note} trong các trang đã tìm."
                 + and_hint
-                + "\nNếu tra theo tên cơ quan, thử cụm ngắn hơn (vd. Lâm Đồng, Công an). "
-                "Nếu trên cổng có nhưng ở mục đã đóng thầu/rút thì bot sẽ không liệt kê. "
-                "Có thể tăng CRAWL_MAX_PAGES hoặc INTERACTIVE_CRAWL_MAX_PAGES trong .env."
+                + no_result_hint
             )
             if n_from_portal > 0:
                 summary += (
@@ -153,13 +167,13 @@ def run_interactive_keyword_search(
                 )
         elif total > sent:
             summary = (
-                f"Tìm thấy {total} gói [{mode_label}]. Đã gửi {sent} tin (giới hạn {cap}/lần).\n"
+                f"Tìm thấy {total} gói [{mode_label}]{closed_note}. Đã gửi {sent} tin (giới hạn {cap}/lần).\n"
                 "Thu hẹp từ khóa hoặc xem chi tiết trên muasamcong để tiếp tục lọc."
             )
             if n_from_portal > total:
                 summary += f" (Đã cào tối đa ~{max_slots} ô kết quả; API trả {n_from_portal} gói khác nhau.)"
         else:
-            summary = f"Tìm thấy {total} gói [{mode_label}]. Đã gửi {sent} tin."
+            summary = f"Tìm thấy {total} gói [{mode_label}]{closed_note}. Đã gửi {sent} tin."
             if total == 1 and n_from_portal > 1:
                 summary += (
                     f"\nLưu ý: bot đã gom tối đa {secrets.interactive_fetch_max_pages} trang ES × "
@@ -167,9 +181,10 @@ def run_interactive_keyword_search(
                     f"API trả {n_from_portal} gói khác nhau, chỉ 1 gói đáp ứng đủ điều kiện lọc."
                 )
             elif total == 1 and n_from_portal == 1:
+                scope_desc = scope_label
                 summary += (
                     f" Trong phạm vi đã cào ({secrets.interactive_fetch_max_pages} trang ES/cụm), "
-                    "cổng chỉ trả đúng 1 gói TBMT mở thầu khớp tìm kiếm."
+                    f"cổng chỉ trả đúng 1 gói TBMT ({scope_desc}) khớp tìm kiếm."
                 )
 
         return sent, total, summary
