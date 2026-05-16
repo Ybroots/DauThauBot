@@ -12,11 +12,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pyproject.toml README.md run_railway.py ./
 COPY config ./config
+
+# Bust cache khi src đổi (Railway hay giữ layer cũ)
+ARG APP_REV=20260516-scheduler-utc
+RUN echo "APP_REV=${APP_REV}"
+
 COPY src ./src
 
-# Cài package tracker (src/tracker) vào site-packages — tránh ModuleNotFoundError
-RUN pip install --no-cache-dir .
-
+# Chỉ dùng /app/src qua PYTHONPATH — không pip install . (tránh site-packages cũ)
 ENV PYTHONPATH=/app/src
 
 # Volume Railway gắn tại /data (SQLite + tuỳ chọn keywords.yaml)

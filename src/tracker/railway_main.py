@@ -12,6 +12,9 @@ from . import bot_commands
 from . import scheduler as sched_module
 from .config import Secrets
 
+# Đổi khi deploy quan trọng — log giúp biết Railway đã chạy image mới
+DEPLOY_REV = "20260516-scheduler-utc-v2"
+
 
 def _use_stdout_logging() -> bool:
     return bool(os.environ.get("RAILWAY_ENVIRONMENT", "").strip()) or os.environ.get(
@@ -39,7 +42,13 @@ def main() -> None:
 
         _setup_logging(secrets.log_level)
 
-    logger.info("railway_main: scheduler + Telegram bot (1 process)")
+    sched_tz = getattr(sched_module, "SCHEDULER_TZ", None)
+    if sched_tz != "UTC":
+        raise RuntimeError(
+            f"scheduler.py cũ (SCHEDULER_TZ={sched_tz!r}). Redeploy với Clear build cache."
+        )
+
+    logger.info("railway_main: scheduler + Telegram bot (1 process) rev={}", DEPLOY_REV)
     bot_thread = threading.Thread(target=bot_commands.main, daemon=True, name="telegram_bot")
     bot_thread.start()
     logger.info("Telegram bot thread started (getUpdates long polling)")

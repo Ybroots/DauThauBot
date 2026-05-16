@@ -23,7 +23,7 @@ def _preflight() -> None:
     print(f"[run_railway] src_exists={_SRC.is_dir()}", file=sys.stderr, flush=True)
     tracker_pkg = _SRC / "tracker"
     print(f"[run_railway] tracker_pkg={tracker_pkg.is_dir()}", file=sys.stderr, flush=True)
-    for mod in ("httpx", "pydantic", "pydantic_settings", "yaml", "apscheduler", "loguru"):
+    for mod in ("httpx", "pydantic", "pydantic_settings", "yaml", "apscheduler", "loguru", "tzdata"):
         try:
             __import__(mod)
         except ImportError as e:
@@ -39,6 +39,17 @@ def _preflight() -> None:
 if __name__ == "__main__":
     try:
         _preflight()
+        from tracker import scheduler as _sched  # noqa: E402
+
+        if getattr(_sched, "SCHEDULER_TZ", None) != "UTC":
+            print(
+                "[run_railway] LOI: scheduler.py chua cap nhat (can SCHEDULER_TZ=UTC). "
+                "Railway: Redeploy + Clear build cache.",
+                file=sys.stderr,
+                flush=True,
+            )
+            sys.exit(1)
+
         from tracker.railway_main import main  # noqa: E402
 
         main()
