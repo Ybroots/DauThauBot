@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import ssl
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -23,6 +24,16 @@ INDEX_URL = (
     "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=index"
 )
 RECAPTCHA_SITE_KEY = "6LfCo9gpAAAAAL1u9qzvWYSrZuYkFsFEjpVruyd5"
+
+
+def _httpx_ssl_verify() -> ssl.SSLContext | bool:
+    """OpenSSL 3 (Docker/Railway) hay báo DH_KEY_TOO_SMALL với muasamcong — hạ SECLEVEL."""
+    try:
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+        return ctx
+    except ssl.SSLError:
+        return True
 
 
 def _retry_search_if_transient(exc: BaseException) -> bool:
@@ -163,12 +174,14 @@ class MuasamcongCrawler:
         self._session_warmed = False
         self._last_request_at = 0.0
         self._field_names: dict[str, str] = dict(INVEST_FIELD_NAMES)
+        _verify = _httpx_ssl_verify()
         try:
             self.client = httpx.Client(
                 base_url=BASE_URL,
                 timeout=timeout,
                 http2=True,
                 follow_redirects=True,
+                verify=_verify,
                 headers={
                     "User-Agent": self.user_agent,
                     "Accept": "application/json, text/plain, */*",
@@ -184,6 +197,7 @@ class MuasamcongCrawler:
                 base_url=BASE_URL,
                 timeout=timeout,
                 follow_redirects=True,
+                verify=_verify,
                 headers={"User-Agent": self.user_agent},
             )
 
