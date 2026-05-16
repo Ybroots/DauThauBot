@@ -13,7 +13,7 @@ from tenacity import RetryError
 from .config import Secrets, load_keywords_yaml
 from .crawler import BlockedException, MuasamcongCrawler
 from .filter import explain_match, match_bid
-from .interactive_search import parse_keyword_phrases, run_interactive_keyword_search
+from .interactive_search import parse_keyword_phrases, parse_search_query, run_interactive_keyword_search
 from .keyword_suggest import (
     build_suggest_reply,
     extract_suggestions,
@@ -135,6 +135,8 @@ def _execute_search(
     phrases: list[str],
     target_chat_id: str | int,
     chat_scope_key: str,
+    *,
+    mode: str = "any",
 ) -> None:
     phrases = [p for p in phrases if p.strip()]
     if not phrases:
@@ -148,16 +150,18 @@ def _execute_search(
             f"Chờ thêm ~{secs}s rồi tra tiếp (tránh spam cào nhiều lần).",
         )
         return
+    mode_note = " [AND — tất cả phải khớp]" if mode == "all" else ""
     _reply(
         secrets.telegram_bot_token,
         target_chat_id,
-        "Đang tra trên Muasamcong (Playwright có thể mất 30–90 giây), vui lòng chờ…",
+        f"Đang tra trên Muasamcong{mode_note} (Playwright có thể mất 30–90 giây), vui lòng chờ…",
     )
     try:
         sent, total, summary = run_interactive_keyword_search(
             secrets,
             phrases,
             target_chat_id=target_chat_id,
+            mode=mode,
         )
         logger.info(
             "interactive_search done chat={} sent={} matched={}",
@@ -201,12 +205,14 @@ def _execute_search(
 def HELP_VI() -> str:
     return (
         "Luồng cron: tracker trên máy + keyword groups trong DB.\n\n"
-        "Tra nhanh — một tin là bot chạy (không bắt buộc 2 bước):\n"
-        "• /tim camera — khuyến nghị trong nhóm\n"
-        "• /tim camera | máy chủ — OR nhiều cụm\n"
-        "• /tim — nếu gõ trống: bot chờ tin kế tiếp (chat riêng vẫn nên dùng /tim camera cho nhanh)\n\n"
-        "Chat riêng: gõ một dòng từ khóa (VD: camera) là tra luôn, không cần /tim.\n"
-        "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true để gõ thẳng như chat riêng.\n\n"
+        "Tra nhanh — một tin là bot chạy:\n"
+        "• /tim camera                    — 1 từ khóa\n"
+        "• /tim camera | cctv             — OR: bất kỳ khớp\n"
+        "• /tim camera & lâm đồng        — AND: tất cả phải khớp\n"
+        "• /tim Công an tỉnh Lâm Đồng    — tìm theo tên cơ quan\n"
+        "• /tim camera & lâm đồng & giám sát — AND 3 điều kiện\n\n"
+        "Chat riêng: gõ thẳng từ khóa (không cần /tim). Hỗ trợ & để AND.\n"
+        "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
         "Gợi ý & tạo keyword group từ dữ liệu thực:\n"
         "• /goiy lâm đồng — bot cào cổng, gợi ý từ liên quan\n"
@@ -543,17 +549,23 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         return
 
     if cmd in ("/tim", "/timkiem", "/search"):
-        phrases = parse_keyword_phrases(rest)
+        phrases, search_mode = parse_search_query(rest)
         if phrases:
             _await_keyword.pop(ukey, None)
-            _execute_search(secrets, phrases, chat_id, cid_s)
+            _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode)
             return
         _await_keyword[ukey] = True
         hint = (
-            "Nhanh nhất: gửi lại một tin /tim kèm từ khóa, ví dụ: /tim camera\n\n"
-            "Hoặc gửi tin kế tiếp chỉ có từ khóa (OR):\n"
-            "• camera\n"
-            "• lâm đồng, công nghệ thông tin\n\nThoát: /hủy"
+            "Nhanh nhất: gửi lại một tin /tim kèm từ khóa.\n\n"
+            "OR (bất kỳ khớp là đủ) — dùng dấu phẩy hoặc |:\n"
+            "  /tim camera, lâm đồng\n"
+            "  /tim camera | cctv\n\n"
+            "AND (tất cả phải khớp) — dùng dấu &:\n"
+            "  /tim công an & lâm đồng\n"
+            "  /tim camera & lâm đồng & giám sát\n\n"
+            "Hoặc gõ tên cơ quan trực tiếp:\n"
+            "  /tim Công an tỉnh Lâm Đồng\n\n"
+            "Thoát: /hủy"
         )
         _reply(bot_token, chat_id, hint)
         return
@@ -629,34 +641,35 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         # Không phải số → bỏ qua suggest state, xử lý bình thường bên dưới
 
     if _await_keyword.get(ukey):
-        phrases = parse_keyword_phrases(text.strip())
+        phrases, search_mode = parse_search_query(text.strip())
         if not phrases:
-            _reply(bot_token, chat_id, "Chưa có từ khóa. Ví dụ camera. /hủy để thoát.")
+            _reply(bot_token, chat_id, "Chưa có từ khóa. Ví dụ: camera  hoặc  camera & lâm đồng (AND). /hủy để thoát.")
             return
         _await_keyword.pop(ukey, None)
-        _execute_search(secrets, phrases, chat_id, cid_s)
+        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode)
         return
 
     stripped = text.strip()
     if not stripped:
         return
 
-    phrases = []
+    phrases: list[str] = []
+    search_mode = "any"
     private = chat_type == "private"
     if private:
-        phrases = parse_keyword_phrases(stripped)
+        phrases, search_mode = parse_search_query(stripped)
     elif secrets.bot_group_freeword and chat_type in ("group", "supergroup"):
-        phrases = parse_keyword_phrases(stripped)
+        phrases, search_mode = parse_search_query(stripped)
     elif chat_type in ("group", "supergroup") and secrets.bot_group_reply_hint:
         _reply(
             bot_token,
             chat_id,
-            "Tra nhanh trong nhóm: /tim rồi gửi từ khóa, hoặc /tim camera, lâm đồng",
+            "Tra nhanh trong nhóm: /tim rồi gửi từ khóa, hoặc /tim camera & lâm đồng (AND)",
         )
         return
 
     if phrases:
-        _execute_search(secrets, phrases, chat_id, cid_s)
+        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode)
 
 
 def poll_loop() -> None:
