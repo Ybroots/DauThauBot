@@ -3,7 +3,14 @@ FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    TZ=Asia/Ho_Chi_Minh
+
+# IANA tz cho APScheduler zoneinfo (Asia/Ho_Chi_Minh) trên image tối giản
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Ho_Chi_Minh /etc/localtime \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

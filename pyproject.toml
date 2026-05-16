@@ -17,6 +17,7 @@ dependencies = [
     "apscheduler>=3.10",
     "loguru>=0.7",
     "pytz>=2024.1",
+    "tzdata>=2024.1",
     "tenacity>=8.2",
 ]
 
