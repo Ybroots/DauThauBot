@@ -7,9 +7,9 @@ import time
 
 from loguru import logger
 
-from .config import KeywordsConfig, Secrets
+from .config import KeywordGroup, KeywordsConfig, Secrets
 from .crawler import MuasamcongCrawler
-from .filter import matches_keywords
+from .filter import match_bid
 from .models import Bid
 from .formatter import format_bid_message
 from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, send_message
@@ -36,7 +36,7 @@ def run_interactive_keyword_search(
 
     Returns (sent_count, total_matching, summary_plain).
     Không đụng vào SQLite."""
-    cfg = KeywordsConfig(keywords=phrases, locations=[], fields=[], min_budget_vnd=None)
+    cfg = KeywordsConfig(groups=[KeywordGroup(name="Search", require="any", keywords=phrases)])
     cap = secrets.interactive_search_max_messages
 
     crawler = MuasamcongCrawler(
@@ -75,7 +75,7 @@ def run_interactive_keyword_search(
         bids = list(by_code.values())
 
         for bid in bids:
-            ok, ks = matches_keywords(
+            ok, ks, _ = match_bid(
                 bid,
                 cfg,
                 strict_keywords=secrets.interactive_search_strict_keywords,

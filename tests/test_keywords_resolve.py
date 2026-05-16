@@ -15,7 +15,10 @@ def test_load_keywords_explicit_path(tmp_path: Path) -> None:
     )
     cfg = load_keywords(path=p)
     assert isinstance(cfg, KeywordsConfig)
-    assert cfg.keywords == ["x"]
+    # Legacy flat keywords are wrapped into a single OR group
+    assert len(cfg.groups) == 1
+    assert cfg.groups[0].require == "any"
+    assert "x" in cfg.groups[0].keywords
 
 
 def test_default_keywords_path_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -121,11 +121,24 @@ class Secrets(BaseSettings):
         return value if value else None
 
 
-class KeywordsConfig(BaseModel):
+class KeywordGroup(BaseModel):
+    name: str
+    require: Literal["all", "any"] = "all"
     keywords: list[str] = Field(default_factory=list)
-    locations: list[str] = Field(default_factory=list)
-    fields: list[str] = Field(default_factory=list)
-    min_budget_vnd: Optional[int] = None
+
+
+class KeywordsConfig(BaseModel):
+    groups: list[KeywordGroup] = Field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "KeywordsConfig":
+        if "groups" in data:
+            return cls.model_validate(data)
+        # Legacy flat keywords list → wrap as single OR group
+        kws = [str(k) for k in (data.get("keywords") or []) if k]
+        if kws:
+            return cls(groups=[KeywordGroup(name="Default", require="any", keywords=kws)])
+        return cls()
 
 
 def _default_keywords_yaml_path() -> Path:
@@ -144,8 +157,13 @@ def _default_keywords_yaml_path() -> Path:
     return PROJECT_ROOT / "config" / "keywords.example.yaml"
 
 
-def load_keywords(path: Path | None = None) -> KeywordsConfig:
+def load_keywords_yaml(path: Path | None = None) -> KeywordsConfig:
+    """Load keywords config from YAML — only used for initial DB seed."""
     resolved = path or _default_keywords_yaml_path()
     with open(resolved, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    return KeywordsConfig.model_validate(data)
+    return KeywordsConfig.from_dict(data)
+
+
+def load_keywords(path: Path | None = None) -> KeywordsConfig:
+    return load_keywords_yaml(path)

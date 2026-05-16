@@ -10,16 +10,24 @@ import httpx
 from loguru import logger
 from tenacity import RetryError
 
-from .config import Secrets, load_keywords
+from .config import Secrets, load_keywords_yaml
 from .crawler import BlockedException
+from .filter import explain_match, match_bid
 from .interactive_search import parse_keyword_phrases, run_interactive_keyword_search
+from .models import Bid
 from .storage import (
+    add_group,
+    add_keyword_to_group,
     count_sent_since,
     count_sent_since_hours,
     count_unsent_in_db,
     init_db,
     list_recent_bids,
     list_unsent,
+    load_groups_from_db,
+    remove_group,
+    remove_keyword_from_group,
+    seed_groups_from_yaml,
     total_bids_in_db,
 )
 from .__main__ import run_once
@@ -183,7 +191,7 @@ def _execute_search(
 
 def HELP_VI() -> str:
     return (
-        "Luồng cron: tracker trên máy + config/keywords.yaml.\n\n"
+        "Luồng cron: tracker trên máy + keyword groups trong DB.\n\n"
         "Tra nhanh — một tin là bot chạy (không bắt buộc 2 bước):\n"
         "• /tim camera — khuyến nghị trong nhóm\n"
         "• /tim camera | máy chủ — OR nhiều cụm\n"
@@ -191,7 +199,15 @@ def HELP_VI() -> str:
         "Chat riêng: gõ một dòng từ khóa (VD: camera) là tra luôn, không cần /tim.\n"
         "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true để gõ thẳng như chat riêng.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
-        "Lệnh khác: /lenh — danh sách ngắn. /thongke /lichsu /chuagui /keywords /id /ping /test /hủy"
+        "Quản lý keyword groups (AND/OR logic):\n"
+        "• /groups — xem tất cả groups\n"
+        "• /addgroup Tên | all | kw1, kw2 — tạo group AND\n"
+        "• /addgroup Tên | any | kw1, kw2 — tạo group OR\n"
+        "• /removegroup Tên — xóa group\n"
+        "• /addkw Tên | keyword — thêm keyword vào group\n"
+        "• /removekw Tên | keyword — xóa keyword khỏi group\n"
+        "• /testkw từ khóa thử — debug group nào match\n\n"
+        "Lệnh khác: /lenh — danh sách ngắn. /thongke /lichsu /chuagui /id /ping /test /hủy"
     )
 
 
@@ -199,10 +215,15 @@ def COMMAND_LIST_VI() -> str:
     return (
         "Lệnh bot DauThauBot:\n"
         "• /tim — tra TBMT theo từ khóa (xem /help)\n"
+        "• /groups — xem keyword groups (AND/OR logic)\n"
+        "• /addgroup Tên | all|any | kw1, kw2 — tạo group mới\n"
+        "• /removegroup Tên — xóa group\n"
+        "• /addkw Tên | keyword — thêm keyword vào group\n"
+        "• /removekw Tên | keyword — xóa keyword khỏi group\n"
+        "• /testkw từ khóa — debug group nào match\n"
         "• /thongke — gửi tin 24h / 7 ngày / 30 ngày + tổng DB + chưa gửi\n"
         "• /lichsu [n] — n tin gần nhất trong DB (mặc định 10, tối đa 25)\n"
         "• /chuagui — các gói đã thấy nhưng chưa gửi Telegram (tối đa 15 dòng)\n"
-        "• /keywords — từ khóa cron (keywords.yaml)\n"
         "• /stats — tóm tắt 7 ngày (giữ tương thích)\n"
         "• /id — chat_id & user_id (điền .env)\n"
         "• /ping /about — bot sống + phiên bản\n"
@@ -249,19 +270,105 @@ def handle_slash(
             "Gán vào .env: TELEGRAM_CHAT_IDS / TELEGRAM_ADMIN_CHAT_ID."
         )
 
-    if cmd == "/keywords":
-        cfg = load_keywords()
-        lines = "\n".join(f"• {k}" for k in cfg.keywords) or "(trống)"
-        loc = ", ".join(cfg.locations) if cfg.locations else "(không)"
-        fld = ", ".join(cfg.fields) if cfg.fields else "(không)"
-        budget = cfg.min_budget_vnd
-        btxt = f"{budget:,} đ".replace(",", ".") if budget else "(không)"
-        return (
-            "Từ khóa cron (keywords.yaml):\n"
-            + lines
-            + f"\n\nĐịa điểm lọc: {loc}\nLĩnh vực lọc: {fld}\nNgân sách tối thiểu: {btxt}\n"
-            + "\nChỉnh file trên máy host; bot không ghi lại file này."
+    if cmd in ("/keywords", "/groups"):
+        init_db()
+        cfg = load_groups_from_db()
+        if not cfg.groups:
+            return (
+                "Chưa có keyword group nào trong DB.\n"
+                "Dùng /addgroup để tạo, hoặc khởi động lại tracker để seed từ keywords.yaml."
+            )
+        lines = [f"📋 Keyword groups ({len(cfg.groups)} groups):"]
+        for i, g in enumerate(cfg.groups, 1):
+            req = "TẤT CẢ — AND" if g.require == "all" else "BẤT KỲ — OR"
+            sep = " + " if g.require == "all" else " | "
+            kws_str = sep.join(g.keywords) if g.keywords else "(trống)"
+            lines.append(f"{i}. {g.name} [{req}]\n   {kws_str}")
+        lines.append("\nDùng /addgroup, /removegroup, /addkw, /removekw để quản lý.")
+        return "\n".join(lines)
+
+    if cmd == "/addgroup":
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /addgroup chỉ dành cho admin."
+        parts = [p.strip() for p in rest.split("|")]
+        if len(parts) < 3:
+            return (
+                "Cú pháp: /addgroup Tên | all|any | kw1, kw2\n"
+                "Ví dụ: /addgroup Camera LĐ | all | camera, lâm đồng"
+            )
+        name = parts[0]
+        require = parts[1].strip().lower()
+        if require not in ("all", "any"):
+            return "Chế độ phải là 'all' (AND) hoặc 'any' (OR)."
+        kws = [k.strip() for k in parts[2].split(",") if k.strip()]
+        if not name:
+            return "Tên group không được trống."
+        init_db()
+        ok = add_group(name, require, kws)
+        if not ok:
+            return f'Group "{name}" đã tồn tại. Dùng /addkw để thêm từ khóa.'
+        req_label = "TẤT CẢ phải khớp" if require == "all" else "BẤT KỲ khớp là đủ"
+        return f'✅ Đã thêm group "{name}" [{req_label}]\n   Keywords: {", ".join(kws)}'
+
+    if cmd == "/removegroup":
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /removegroup chỉ dành cho admin."
+        name = rest.strip()
+        if not name:
+            return "Cú pháp: /removegroup Tên group"
+        init_db()
+        ok = remove_group(name)
+        if not ok:
+            return f'Không tìm thấy group "{name}".'
+        return f'✅ Đã xóa group "{name}"'
+
+    if cmd == "/addkw":
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /addkw chỉ dành cho admin."
+        parts = [p.strip() for p in rest.split("|", 1)]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return "Cú pháp: /addkw Tên group | keyword"
+        group_name, keyword = parts[0], parts[1]
+        init_db()
+        ok = add_keyword_to_group(group_name, keyword)
+        if not ok:
+            return f'Không tìm thấy group "{group_name}" hoặc keyword đã tồn tại.'
+        return f'✅ Đã thêm "{keyword}" vào group "{group_name}"'
+
+    if cmd == "/removekw":
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /removekw chỉ dành cho admin."
+        parts = [p.strip() for p in rest.split("|", 1)]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return "Cú pháp: /removekw Tên group | keyword"
+        group_name, keyword = parts[0], parts[1]
+        init_db()
+        ok = remove_keyword_from_group(group_name, keyword)
+        if not ok:
+            return f'Không tìm thấy group "{group_name}" hoặc keyword "{keyword}".'
+        return f'✅ Đã xóa "{keyword}" khỏi group "{group_name}"'
+
+    if cmd == "/testkw":
+        query = rest.strip()
+        if not query:
+            return "Cú pháp: /testkw từ khóa thử nghiệm\nVí dụ: /testkw camera lâm đồng"
+        from datetime import datetime, timezone
+        _now = datetime.now(timezone.utc)
+        bid = Bid(
+            tbmt_code="TEST",
+            title=query,
+            status="",
+            investor="",
+            posted_at=_now,
+            closing_at=_now,
+            field="",
+            location="",
+            bid_method="",
+            detail_url="",
         )
+        init_db()
+        cfg = load_groups_from_db()
+        return explain_match(bid, cfg)
 
     if cmd == "/stats":
         init_db()

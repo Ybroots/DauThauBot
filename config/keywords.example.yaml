@@ -1,9 +1,24 @@
-keywords:
-  - "lâm đồng"
-  - "truyền thanh thông minh"
-  - "camera"
-  - "truyền dẫn"
+groups:
+  - name: "Camera Lâm Đồng"
+    require: all
+    keywords:
+      - "camera"
+      - "lâm đồng"
 
-locations: []
-fields: []
-min_budget_vnd: null
+  - name: "Truyền thanh Lâm Đồng"
+    require: all
+    keywords:
+      - "truyền thanh thông minh"
+      - "lâm đồng"
+
+  - name: "Camera toàn quốc"
+    require: any
+    keywords:
+      - "camera"
+      - "cctv"
+      - "giám sát hình ảnh"
+
+  - name: "Truyền dẫn toàn quốc"
+    require: any
+    keywords:
+      - "truyền dẫn"

@@ -4,7 +4,7 @@ import re
 import unicodedata
 from typing import Any, Optional
 
-from .config import KeywordsConfig
+from .config import KeywordGroup, KeywordsConfig
 from .models import Bid
 
 
@@ -62,13 +62,8 @@ def _keyword_matches_in_haystack(
     )
 
 
-def matches_keywords(
-    bid: Bid,
-    cfg: KeywordsConfig,
-    *,
-    strict_keywords: bool = False,
-) -> tuple[bool, list[str]]:
-    haystack = normalize(
+def _build_haystack(bid: Bid) -> str:
+    return normalize(
         " ".join(
             filter(
                 None,
@@ -86,26 +81,59 @@ def matches_keywords(
         )
     )
 
-    matched: list[str] = []
-    if cfg.keywords:
-        for kw in cfg.keywords:
-            kn = normalize(kw)
-            if _keyword_matches_in_haystack(haystack, kn, strict_word=strict_keywords):
-                matched.append(kw)
-        if not matched:
-            return False, []
 
-    if cfg.locations:
-        loc_hay = normalize(bid.location)
-        if not any(normalize(loc) in loc_hay for loc in cfg.locations):
-            return False, matched
+def group_matches(
+    group: KeywordGroup, haystack: str, *, strict_keywords: bool = False
+) -> bool:
+    nkws = [normalize(k) for k in group.keywords if k.strip()]
+    if not nkws:
+        return False
+    if group.require == "all":
+        return all(
+            _keyword_matches_in_haystack(haystack, k, strict_word=strict_keywords)
+            for k in nkws
+        )
+    return any(
+        _keyword_matches_in_haystack(haystack, k, strict_word=strict_keywords)
+        for k in nkws
+    )
 
-    if cfg.fields:
-        if not any(normalize(f) == normalize(bid.field) for f in cfg.fields):
-            return False, matched
 
-    if cfg.min_budget_vnd and bid.budget_vnd:
-        if bid.budget_vnd < cfg.min_budget_vnd:
-            return False, matched
+def match_bid(
+    bid: Bid, cfg: KeywordsConfig, *, strict_keywords: bool = False
+) -> tuple[bool, list[str], str]:
+    """Returns (matched, matched_keywords, group_name)."""
+    haystack = _build_haystack(bid)
+    for group in cfg.groups:
+        if group_matches(group, haystack, strict_keywords=strict_keywords):
+            matched_kws = [
+                k
+                for k in group.keywords
+                if _keyword_matches_in_haystack(
+                    haystack, normalize(k), strict_word=strict_keywords
+                )
+            ]
+            return True, matched_kws, group.name
+    return False, [], ""
 
-    return True, matched
+
+def explain_match(bid: Bid, cfg: KeywordsConfig) -> str:
+    """Human-readable breakdown of which groups match — used by /test bot command."""
+    haystack = _build_haystack(bid)
+    lines = [f'🔬 Test với bid: "{bid.title}"']
+    for group in cfg.groups:
+        req_label = "TẤT CẢ" if group.require == "all" else "BẤT KỲ"
+        nkws = [(k, normalize(k)) for k in group.keywords if k.strip()]
+        ok_count = sum(1 for _, nk in nkws if nk in haystack)
+        if group.require == "all":
+            group_ok = ok_count == len(nkws) and len(nkws) > 0
+        else:
+            group_ok = ok_count > 0
+        icon = "✅" if group_ok else "❌"
+        lines.append(
+            f'{icon} Group "{group.name}" ({req_label}): {ok_count}/{len(nkws)} khớp'
+        )
+        for k, nk in nkws:
+            mark = "✓" if nk in haystack else "✗"
+            lines.append(f'   {mark} "{k}"')
+    return "\n".join(lines)

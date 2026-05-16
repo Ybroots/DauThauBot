@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config import PROJECT_ROOT
+from .config import PROJECT_ROOT, KeywordGroup, KeywordsConfig
 
 _dd = os.environ.get("DATA_DIR", "").strip()
 DATA_ROOT = Path(_dd) if _dd else (PROJECT_ROOT / "data")
@@ -15,6 +15,7 @@ DB_PATH = DATA_ROOT / "seen.db"
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS seen_bids (
@@ -26,6 +27,28 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_at ON seen_bids(seen_at)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keyword_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                require TEXT NOT NULL DEFAULT 'all',
+                active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL REFERENCES keyword_groups(id) ON DELETE CASCADE,
+                keyword TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(group_id, keyword)
+            )
+            """
+        )
 
 
 def is_seen(tbmt_code: str) -> bool:
@@ -130,3 +153,108 @@ def list_unsent() -> list[tuple[str, str]]:
             "SELECT tbmt_code, title FROM seen_bids WHERE sent_to_telegram = 0"
         )
         return list(cur.fetchall())
+
+
+def load_groups_from_db() -> KeywordsConfig:
+    """Load all active keyword groups from DB — used at runtime."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        groups_rows = conn.execute(
+            "SELECT id, name, require FROM keyword_groups WHERE active = 1"
+        ).fetchall()
+        result: list[KeywordGroup] = []
+        for gid, name, require in groups_rows:
+            kw_rows = conn.execute(
+                "SELECT keyword FROM keywords WHERE group_id = ?", (gid,)
+            ).fetchall()
+            result.append(KeywordGroup(name=name, require=require, keywords=[r[0] for r in kw_rows]))
+    return KeywordsConfig(groups=result)
+
+
+def seed_groups_from_yaml(cfg: KeywordsConfig) -> None:
+    """Insert groups from YAML only if DB has no groups (idempotent seed)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        count = conn.execute("SELECT COUNT(*) FROM keyword_groups").fetchone()[0]
+        if count > 0:
+            return
+        for group in cfg.groups:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO keyword_groups(name, require) VALUES (?, ?)",
+                (group.name, group.require),
+            )
+            gid = cur.lastrowid
+            if gid:
+                for kw in group.keywords:
+                    kw = kw.strip()
+                    if kw:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO keywords(group_id, keyword) VALUES (?, ?)",
+                            (gid, kw),
+                        )
+
+
+def add_group(name: str, require: str, keywords: list[str]) -> bool:
+    """Create a new keyword group. Returns False if name already exists."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cur = conn.execute(
+                "INSERT INTO keyword_groups(name, require) VALUES (?, ?)",
+                (name, require),
+            )
+            gid = cur.lastrowid
+            for kw in keywords:
+                kw = kw.strip()
+                if kw:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO keywords(group_id, keyword) VALUES (?, ?)",
+                        (gid, kw),
+                    )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def remove_group(name: str) -> bool:
+    """Delete a group and all its keywords. Returns False if not found."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cur = conn.execute("DELETE FROM keyword_groups WHERE name = ?", (name,))
+        return cur.rowcount > 0
+
+
+def add_keyword_to_group(group_name: str, keyword: str) -> bool:
+    """Add a keyword to an existing group. Returns False if group not found or keyword duplicate."""
+    keyword = keyword.strip()
+    if not keyword:
+        return False
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        row = conn.execute(
+            "SELECT id FROM keyword_groups WHERE name = ?", (group_name,)
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            conn.execute(
+                "INSERT INTO keywords(group_id, keyword) VALUES (?, ?)", (row[0], keyword)
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_keyword_from_group(group_name: str, keyword: str) -> bool:
+    """Remove a keyword from a group. Returns False if group or keyword not found."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        row = conn.execute(
+            "SELECT id FROM keyword_groups WHERE name = ?", (group_name,)
+        ).fetchone()
+        if not row:
+            return False
+        cur = conn.execute(
+            "DELETE FROM keywords WHERE group_id = ? AND keyword = ?", (row[0], keyword)
+        )
+        return cur.rowcount > 0

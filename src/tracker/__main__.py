@@ -5,12 +5,12 @@ import time
 
 from loguru import logger
 
-from .config import PROJECT_ROOT, Secrets, load_keywords
+from .config import PROJECT_ROOT, Secrets, load_keywords_yaml
 from .crawler import BlockedException, MuasamcongCrawler
-from .filter import matches_keywords
+from .filter import match_bid
 from .formatter import format_bid_message
 from .models import Bid
-from .storage import init_db, mark_seen, was_sent
+from .storage import init_db, load_groups_from_db, mark_seen, seed_groups_from_yaml, was_sent
 from .telegram import send_to_chats
 
 _consecutive_empty = 0
@@ -18,7 +18,16 @@ _consecutive_blocks = 0
 
 
 def _tracker_keyword_strings(keywords_cfg) -> list[str]:
-    return [str(k).strip() for k in keywords_cfg.keywords if k and str(k).strip()]
+    """Extract all unique keywords across all groups for server-side ES queries."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in keywords_cfg.groups:
+        for k in group.keywords:
+            k = str(k).strip()
+            if k and k not in seen:
+                out.append(k)
+                seen.add(k)
+    return out
 
 
 def _collect_bids_crawl(
@@ -88,8 +97,9 @@ def run_once() -> None:
     global _consecutive_empty, _consecutive_blocks
 
     secrets = Secrets()
-    keywords_cfg = load_keywords()
     init_db()
+    seed_groups_from_yaml(load_keywords_yaml())
+    keywords_cfg = load_groups_from_db()
 
     crawler = MuasamcongCrawler(
         page_size=secrets.crawl_page_size,
@@ -123,7 +133,7 @@ def run_once() -> None:
             if was_sent(bid.tbmt_code):
                 continue
 
-            matched, kw = matches_keywords(bid, keywords_cfg)
+            matched, kw, group_name = match_bid(bid, keywords_cfg)
             if not matched:
                 mark_seen(bid.tbmt_code, bid.title, sent=False)
                 continue
@@ -140,7 +150,12 @@ def run_once() -> None:
             mark_seen(bid.tbmt_code, bid.title, sent=(success_count > 0))
             if success_count > 0:
                 sent_total += 1
-                logger.info("telegram_send: {} | matched: {}", bid.tbmt_code, kw)
+                logger.info(
+                    "telegram_send: {} | group: {} | matched: {}",
+                    bid.tbmt_code,
+                    group_name,
+                    kw,
+                )
 
         logger.info("Done. New bids sent: {}", sent_total)
         _consecutive_blocks = 0
@@ -152,8 +167,7 @@ def run_once() -> None:
 
 
 def main() -> None:
-    secrets = Secrets()
-    _setup_logging(secrets.log_level)
+    _setup_logging(Secrets().log_level)
     run_once()
 
 
