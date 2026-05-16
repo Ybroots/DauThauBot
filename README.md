@@ -48,6 +48,8 @@ muasamcong-tracker
 python -m tracker.scheduler
 ```
 
+**Railway / VPS (một process: cron + bot Telegram):** xem [DEPLOY_RAILWAY.md](DEPLOY_RAILWAY.md) — lệnh `python -m tracker.railway_main` hoặc `dauthau-railway`.
+
 Lệnh bot (tùy chọn, terminal riêng):
 
 ```bash

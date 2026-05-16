@@ -26,6 +26,7 @@ dev = ["pytest>=7.0", "ruff>=0.4"]
 
 [project.scripts]
 muasamcong-tracker = "tracker.scheduler:main"
+dauthau-railway = "tracker.railway_main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tracker"]

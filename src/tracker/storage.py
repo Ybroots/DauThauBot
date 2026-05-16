@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
+
 from .config import PROJECT_ROOT
 
-DB_PATH = PROJECT_ROOT / "data" / "seen.db"
+_dd = os.environ.get("DATA_DIR", "").strip()
+DATA_ROOT = Path(_dd) if _dd else (PROJECT_ROOT / "data")
+DB_PATH = DATA_ROOT / "seen.db"
 
 
 def init_db() -> None:

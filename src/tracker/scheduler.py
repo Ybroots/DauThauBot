@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, time as dtime, timedelta
+from typing import Optional
+
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -82,16 +84,17 @@ def safe_run() -> None:
         logger.exception("Unhandled error in run_once, but scheduler continues")
 
 
-def main() -> None:
-    secrets = Secrets()
-    _setup_logging(secrets.log_level)
+def main(secrets: Optional[Secrets] = None, *, skip_setup_logging: bool = False) -> None:
+    s = secrets if secrets is not None else Secrets()
+    if not skip_setup_logging:
+        _setup_logging(s.log_level)
 
     scheduler = BlockingScheduler(timezone=TZ)
     scheduler.add_job(
         safe_run,
         IntervalTrigger(
-            minutes=secrets.poll_interval_minutes,
-            jitter=secrets.poll_jitter_seconds,
+            minutes=s.poll_interval_minutes,
+            jitter=s.poll_jitter_seconds,
         ),
         id="crawl_job",
         max_instances=1,
@@ -101,10 +104,10 @@ def main() -> None:
 
     logger.info(
         "Scheduler started: interval={}m ±{}s jitter, quiet={}-{}",
-        secrets.poll_interval_minutes,
-        secrets.poll_jitter_seconds,
-        secrets.quiet_hours_start,
-        secrets.quiet_hours_end,
+        s.poll_interval_minutes,
+        s.poll_jitter_seconds,
+        s.quiet_hours_start,
+        s.quiet_hours_end,
     )
     safe_run()
     try:

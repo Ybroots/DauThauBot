@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -127,8 +128,24 @@ class KeywordsConfig(BaseModel):
     min_budget_vnd: Optional[int] = None
 
 
+def _default_keywords_yaml_path() -> Path:
+    """Ưu tiên KEYWORDS_YAML_PATH → /data/keywords.yaml → config/keywords.yaml → example."""
+    env_p = os.environ.get("KEYWORDS_YAML_PATH", "").strip()
+    if env_p:
+        return Path(env_p)
+    data_dir = os.environ.get("DATA_DIR", "").strip()
+    if data_dir:
+        vol = Path(data_dir) / "keywords.yaml"
+        if vol.is_file():
+            return vol
+    local = PROJECT_ROOT / "config" / "keywords.yaml"
+    if local.is_file():
+        return local
+    return PROJECT_ROOT / "config" / "keywords.example.yaml"
+
+
 def load_keywords(path: Path | None = None) -> KeywordsConfig:
-    resolved = path or (PROJECT_ROOT / "config" / "keywords.yaml")
+    resolved = path or _default_keywords_yaml_path()
     with open(resolved, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return KeywordsConfig.model_validate(data)
