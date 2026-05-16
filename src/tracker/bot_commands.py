@@ -27,12 +27,18 @@ from .storage import (
     count_sent_since_hours,
     count_unsent_in_db,
     init_db,
+    list_all_groups_raw,
+    list_bids_since_hours,
     list_recent_bids,
     list_unsent,
     load_groups_from_db,
+    lookup_bid_in_db,
+    remove_bid_from_db,
     remove_group,
     remove_keyword_from_group,
+    rename_group,
     seed_groups_from_yaml,
+    toggle_group_active,
     total_bids_in_db,
 )
 from .__main__ import run_once
@@ -225,13 +231,21 @@ def HELP_VI() -> str:
         "• /goiy lâm đồng — bot cào cổng, gợi ý từ liên quan\n"
         "  → chọn số để hẹp dần → /taogroup để lưu\n\n"
         "Quản lý keyword groups (AND/OR logic):\n"
-        "• /groups — xem tất cả groups\n"
+        "• /groups — xem tất cả groups (gồm cả group đang tắt)\n"
         "• /addgroup Tên | all | kw1, kw2 — tạo group AND\n"
         "• /addgroup Tên | any | kw1, kw2 — tạo group OR\n"
         "• /removegroup Tên — xóa group\n"
         "• /addkw Tên | keyword — thêm keyword vào group\n"
         "• /removekw Tên | keyword — xóa keyword khỏi group\n"
+        "• /renamegroup Tên cũ | Tên mới — đổi tên group\n"
+        "• /tatgroup Tên — tắt group (cron bỏ qua, vẫn tra được bằng /timgroup)\n"
+        "• /batgroup Tên — bật lại group đã tắt\n"
+        "• /timgroup Tên — tìm kiếm ngay theo từ khóa của group\n"
         "• /testkw từ khóa thử — debug group nào match\n\n"
+        "Quản lý dữ liệu:\n"
+        "• /xem MÃ — tra mã TBMT trong DB (tiêu đề, đã gửi chưa)\n"
+        "• /timhom [hours] — gói thấy trong N giờ qua (mặc định 24h)\n"
+        "• /xoa MÃ — admin: xóa mã khỏi DB để cron gửi lại\n\n"
         "Lệnh khác: /lenh — danh sách ngắn. /thongke /lichsu /chuagui /id /ping /test /hủy"
     )
 
@@ -239,24 +253,24 @@ def HELP_VI() -> str:
 def COMMAND_LIST_VI() -> str:
     return (
         "Lệnh bot DauThauBot:\n"
-        "• /tim — tra TBMT theo từ khóa (chỉ gói đang mở thầu)\n"
-        "• /timtat — tra TBMT kể cả gói đã đóng thầu\n"
-        "• /goiy từ_khóa — gợi ý từ liên quan, hẹp dần → /taogroup\n"
-        "• /groups — xem keyword groups (AND/OR logic)\n"
-        "• /addgroup Tên | all|any | kw1, kw2 — tạo group mới\n"
-        "• /removegroup Tên — xóa group\n"
-        "• /addkw Tên | keyword — thêm keyword vào group\n"
-        "• /removekw Tên | keyword — xóa keyword khỏi group\n"
+        "Tìm kiếm:\n"
+        "• /tim kw — tra gói đang mở (OR/AND với |, &)\n"
+        "• /timtat kw — tra kể cả gói đã đóng\n"
+        "• /timgroup Tên — tra theo từ khóa của group đã lưu\n"
+        "• /goiy kw — gợi ý từ liên quan, hẹp dần → /taogroup\n"
+        "\nQuản lý groups:\n"
+        "• /groups — xem tất cả groups (gồm cả tắt)\n"
+        "• /addgroup Tên | all|any | kw1, kw2\n"
+        "• /removegroup /renamegroup /addkw /removekw\n"
+        "• /tatgroup Tên — tắt group khỏi cron\n"
+        "• /batgroup Tên — bật lại group\n"
         "• /testkw từ khóa — debug group nào match\n"
-        "• /thongke — gửi tin 24h / 7 ngày / 30 ngày + tổng DB + chưa gửi\n"
-        "• /lichsu [n] — n tin gần nhất trong DB (mặc định 10, tối đa 25)\n"
-        "• /chuagui — các gói đã thấy nhưng chưa gửi Telegram (tối đa 15 dòng)\n"
-        "• /stats — tóm tắt 7 ngày (giữ tương thích)\n"
-        "• /id — chat_id & user_id (điền .env)\n"
-        "• /ping /about — bot sống + phiên bản\n"
-        "• /test — chạy 1 vòng tracker (cần quyền admin nếu có TELEGRAM_ADMIN_CHAT_ID)\n"
-        "• /help /gioithieu — hướng dẫn dài\n"
-        "• /hủy — thoát bước chờ từ khóa sau /tim"
+        "\nDữ liệu:\n"
+        "• /xem MÃ_TBMT — tra mã trong DB\n"
+        "• /timhom [hours] — gói thấy trong N giờ (mặc định 24h)\n"
+        "• /xoa MÃ — admin: xóa khỏi DB để cron gửi lại\n"
+        "• /thongke /lichsu [n] /chuagui /stats\n"
+        "\nKhác: /id /ping /about /test /help /hủy"
     )
 
 
@@ -299,19 +313,26 @@ def handle_slash(
 
     if cmd in ("/keywords", "/groups"):
         init_db()
-        cfg = load_groups_from_db()
-        if not cfg.groups:
+        all_groups = list_all_groups_raw()
+        if not all_groups:
             return (
                 "Chưa có keyword group nào trong DB.\n"
                 "Dùng /addgroup để tạo, hoặc khởi động lại tracker để seed từ keywords.yaml."
             )
-        lines = [f"📋 Keyword groups ({len(cfg.groups)} groups):"]
-        for i, g in enumerate(cfg.groups, 1):
-            req = "TẤT CẢ — AND" if g.require == "all" else "BẤT KỲ — OR"
-            sep = " + " if g.require == "all" else " | "
-            kws_str = sep.join(g.keywords) if g.keywords else "(trống)"
-            lines.append(f"{i}. {g.name} [{req}]\n   {kws_str}")
-        lines.append("\nDùng /addgroup, /removegroup, /addkw, /removekw để quản lý.")
+        active_n = sum(1 for _, _, a, _ in all_groups if a)
+        inactive_n = len(all_groups) - active_n
+        header = f"📋 Keyword groups ({active_n} đang bật"
+        if inactive_n:
+            header += f", {inactive_n} tắt"
+        header += "):"
+        lines = [header]
+        for i, (name, require, active, kws) in enumerate(all_groups, 1):
+            req = "TẤT CẢ — AND" if require == "all" else "BẤT KỲ — OR"
+            sep = " + " if require == "all" else " | "
+            kws_str = sep.join(kws) if kws else "(trống)"
+            status = "" if active else " [tắt]"
+            lines.append(f"{i}. {name}{status} [{req}]\n   {kws_str}")
+        lines.append("\n/addgroup /removegroup /addkw /removekw /renamegroup /tatgroup /batgroup /timgroup")
         return "\n".join(lines)
 
     if cmd == "/addgroup":
@@ -424,6 +445,110 @@ def handle_slash(
             f"   Keywords: {kw_str}\n\n"
             f"Dùng /groups để xem, /addkw để thêm từ."
         )
+
+    if cmd in ("/xem", "/lookup"):
+        code = rest.strip().upper()
+        if not code:
+            return (
+                "Cú pháp: /xem MÃ_TBMT\n"
+                "Tra thông tin gói thầu đã lưu trong DB.\n"
+                "Ví dụ: /xem 20240001234-00"
+            )
+        init_db()
+        row = lookup_bid_in_db(code)
+        if row is None:
+            return (
+                f'Không tìm thấy mã "{code}" trong DB.\n'
+                "Bot chỉ lưu gói đã qua cron hoặc /tim. Thử /timtat để tìm trên cổng."
+            )
+        title, seen_at, sent = row
+        flag = "Đã gửi Telegram" if sent else "Chưa gửi Telegram"
+        short_at = seen_at[:19].replace("T", " ") if len(seen_at) >= 19 else seen_at
+        # Construct a minimal detail page link — search portal by notifyNo
+        notify_no = code.rsplit("-", 1)[0] if "-" in code else code
+        search_link = (
+            "https://muasamcong.mpi.gov.vn/web/guest/contractor-selection"
+            "?p_p_id=egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2"
+            "&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view"
+            "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=index"
+        )
+        return (
+            f"<b>Mã TBMT:</b> <code>{html.escape(code)}</code>\n"
+            f"<b>Tiêu đề:</b> {html.escape(title)}\n"
+            f"<b>Trạng thái gửi:</b> {flag}\n"
+            f"<b>Thấy lúc:</b> {short_at} UTC\n"
+            f'\n🔗 <a href="{search_link}">Tìm trên muasamcong</a> (tìm mã <code>{html.escape(notify_no)}</code>)'
+        )
+
+    if cmd in ("/renamegroup",):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /renamegroup chỉ dành cho admin."
+        parts = [p.strip() for p in rest.split("|", 1)]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return "Cú pháp: /renamegroup Tên cũ | Tên mới"
+        old_name, new_name = parts[0], parts[1]
+        init_db()
+        ok = rename_group(old_name, new_name)
+        if not ok:
+            return f'Không tìm thấy group "{old_name}" hoặc tên "{new_name}" đã tồn tại.'
+        return f'✅ Đã đổi tên "{old_name}" → "{new_name}"'
+
+    if cmd in ("/tatgroup", "/disablegroup"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /tatgroup chỉ dành cho admin."
+        name = rest.strip()
+        if not name:
+            return "Cú pháp: /tatgroup Tên group\nGroup bị tắt sẽ không dùng trong cron cho đến khi bật lại."
+        init_db()
+        ok = toggle_group_active(name, False)
+        if not ok:
+            return f'Không tìm thấy group "{name}". Xem /groups.'
+        return (
+            f'⏸ Group "{name}" đã tắt — cron bỏ qua group này.\n'
+            "Dùng /batgroup để bật lại, /timgroup để vẫn tra thủ công."
+        )
+
+    if cmd in ("/batgroup", "/enablegroup"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /batgroup chỉ dành cho admin."
+        name = rest.strip()
+        if not name:
+            return "Cú pháp: /batgroup Tên group"
+        init_db()
+        ok = toggle_group_active(name, True)
+        if not ok:
+            return f'Không tìm thấy group "{name}". Xem /groups.'
+        return f'▶️ Group "{name}" đã bật — cron sẽ dùng lại group này.'
+
+    if cmd in ("/timhom", "/today"):
+        hours = _parse_positive_int(rest, default=24, max_v=168, min_v=1)
+        init_db()
+        rows = list_bids_since_hours(hours)
+        if not rows:
+            h_label = f"{hours}h" if hours != 24 else "24h"
+            return f"Không thấy gói nào trong {h_label} vừa qua."
+        lines = []
+        for code, title, seen_at, sent in rows:
+            flag = "gửi" if sent else "chưa"
+            short_time = seen_at[11:16] if len(seen_at) >= 16 else seen_at
+            lines.append(f"• [{flag}] {code} — {_truncate(title, 58)}\n  {short_time} UTC")
+        h_label = f"{hours}h" if hours != 24 else "24h"
+        return f"Gói thấy trong {h_label} ({len(rows)} gói):\n" + "\n".join(lines)
+
+    if cmd in ("/xoa", "/deletebid"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /xoa chỉ dành cho admin."
+        code = rest.strip().upper()
+        if not code:
+            return (
+                "Cú pháp: /xoa MÃ_TBMT\n"
+                "Xóa mã khỏi seen.db → cron sẽ gửi lại lần tiếp theo tìm thấy."
+            )
+        init_db()
+        ok = remove_bid_from_db(code)
+        if not ok:
+            return f'Không tìm thấy mã "{code}" trong DB.'
+        return f'🗑 Đã xóa "{code}" khỏi seen.db. Cron sẽ gửi lại khi tìm thấy gói này.'
 
     if cmd == "/stats":
         init_db()
@@ -598,6 +723,45 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode, include_closed=True)
         return
 
+    if cmd in ("/timgroup",):
+        # Tìm kiếm theo từ khóa của một keyword group đã lưu
+        name = rest.strip()
+        if not name:
+            _reply(
+                bot_token,
+                chat_id,
+                "Cú pháp: /timgroup Tên group\n\n"
+                "Chạy tìm kiếm ngay bằng từ khóa của group đã lưu.\n"
+                "Group tắt (/tatgroup) vẫn có thể dùng lệnh này để tra thử.\n"
+                "Xem /groups để biết danh sách.",
+            )
+            return
+        init_db()
+        all_raw = list_all_groups_raw()  # kể cả inactive
+        matched_g = next(
+            (g for g in all_raw if g[0] == name),
+            None,
+        )
+        if matched_g is None:
+            # thử tìm case-insensitive
+            name_lower = name.lower()
+            matched_g = next((g for g in all_raw if g[0].lower() == name_lower), None)
+        if matched_g is None:
+            _reply(bot_token, chat_id, f'Không tìm thấy group "{name}". Xem /groups.')
+            return
+        g_name, g_require, g_active, g_kws = matched_g
+        if not g_kws:
+            _reply(bot_token, chat_id, f'Group "{g_name}" không có từ khóa nào. Dùng /addkw.')
+            return
+        inactive_note = " [group đang tắt — chỉ tra thủ công]" if not g_active else ""
+        _reply(
+            bot_token,
+            chat_id,
+            f'Đang tra group "{g_name}"{inactive_note} với {len(g_kws)} từ khóa…',
+        )
+        _execute_search(secrets, g_kws, chat_id, cid_s, mode=g_require)
+        return
+
     routed = handle_slash(
         text.strip(),
         secrets,
@@ -606,7 +770,7 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         user_id=int(uid),
     )
     if routed:
-        _reply(bot_token, chat_id, routed, parse_html=cmd in ("/id", "/ma"))
+        _reply(bot_token, chat_id, routed, parse_html=cmd in ("/id", "/ma", "/xem", "/lookup"))
         return
 
     if cmd:

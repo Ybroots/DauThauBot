@@ -258,3 +258,86 @@ def remove_keyword_from_group(group_name: str, keyword: str) -> bool:
             "DELETE FROM keywords WHERE group_id = ? AND keyword = ?", (row[0], keyword)
         )
         return cur.rowcount > 0
+
+
+# ── Các hàm bổ sung ────────────────────────────────────────────────────────
+
+
+def lookup_bid_in_db(tbmt_code: str) -> tuple[str, str, int] | None:
+    """Tra mã TBMT trong seen.db. Trả về (title, seen_at, sent_to_telegram) hoặc None."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT title, seen_at, sent_to_telegram FROM seen_bids WHERE tbmt_code = ?",
+            (tbmt_code.strip(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row[0] or ""), str(row[1]), int(row[2]))
+
+
+def toggle_group_active(name: str, active: bool) -> bool:
+    """Tắt/bật group theo tên. Trả về False nếu không tìm thấy."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "UPDATE keyword_groups SET active = ? WHERE name = ?",
+            (1 if active else 0, name),
+        )
+        return cur.rowcount > 0
+
+
+def rename_group(old_name: str, new_name: str) -> bool:
+    """Đổi tên group. Trả về False nếu không tìm thấy hoặc tên mới đã tồn tại."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.execute(
+                "UPDATE keyword_groups SET name = ? WHERE name = ?",
+                (new_name.strip(), old_name.strip()),
+            )
+            return cur.rowcount > 0
+    except sqlite3.IntegrityError:
+        return False
+
+
+def remove_bid_from_db(tbmt_code: str) -> bool:
+    """Xóa bid khỏi seen.db để cron gửi lại. Trả về False nếu không tìm thấy."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM seen_bids WHERE tbmt_code = ?", (tbmt_code.strip(),)
+        )
+        return cur.rowcount > 0
+
+
+def list_bids_since_hours(hours: int = 24) -> list[tuple[str, str, str, int]]:
+    """Gói đã thấy trong N giờ vừa qua (mới nhất trước, tối đa 50)."""
+    from datetime import timedelta
+
+    hours = max(1, min(hours, 720))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            """
+            SELECT tbmt_code, title, seen_at, sent_to_telegram
+            FROM seen_bids
+            WHERE seen_at >= ?
+            ORDER BY seen_at DESC
+            LIMIT 50
+            """,
+            (cutoff,),
+        )
+        return [(str(r[0]), str(r[1] or ""), str(r[2]), int(r[3])) for r in cur.fetchall()]
+
+
+def list_all_groups_raw() -> list[tuple[str, str, int, list[str]]]:
+    """Tất cả groups kể cả inactive — [(name, require, active, [keywords])]."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        rows = conn.execute(
+            "SELECT id, name, require, active FROM keyword_groups ORDER BY active DESC, name"
+        ).fetchall()
+        result: list[tuple[str, str, int, list[str]]] = []
+        for gid, name, require, active in rows:
+            kws = [r[0] for r in conn.execute(
+                "SELECT keyword FROM keywords WHERE group_id = ?", (gid,)
+            ).fetchall()]
+            result.append((str(name), str(require), int(active), kws))
+        return result
