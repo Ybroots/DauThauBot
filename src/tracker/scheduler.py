@@ -16,7 +16,10 @@ _block_state: dict = {
     "consecutive_blocks": 0,
 }
 
+# Giờ VN cho quiet hours / cooldown — pytz nhúng IANA, không cần package tzdata hệ thống
 TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+# APScheduler 3.x đổi timezone sang zoneinfo → crash trên Docker nếu thiếu tzdata; lịch 45p dùng UTC
+SCHEDULER_TZ = "UTC"
 
 
 def _in_quiet_hours(now: datetime, start_str: str, end_str: str) -> bool:
@@ -89,7 +92,7 @@ def main(secrets: Optional[Secrets] = None, *, skip_setup_logging: bool = False)
     if not skip_setup_logging:
         _setup_logging(s.log_level)
 
-    scheduler = BlockingScheduler(timezone=TZ)
+    scheduler = BlockingScheduler(timezone=SCHEDULER_TZ)
     scheduler.add_job(
         safe_run,
         IntervalTrigger(
@@ -103,9 +106,10 @@ def main(secrets: Optional[Secrets] = None, *, skip_setup_logging: bool = False)
     )
 
     logger.info(
-        "Scheduler started: interval={}m ±{}s jitter, quiet={}-{}",
+        "Scheduler started: interval={}m ±{}s (tz={}), quiet={}-{} (VN)",
         s.poll_interval_minutes,
         s.poll_jitter_seconds,
+        SCHEDULER_TZ,
         s.quiet_hours_start,
         s.quiet_hours_end,
     )
