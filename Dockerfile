@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     DATA_DIR=/data
 
+# Không cài playwright qua pip — dùng bản trong image v1.49.0-jammy
 COPY requirements-docker.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
