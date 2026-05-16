@@ -6,12 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     TZ=Asia/Ho_Chi_Minh
 
-# IANA tz cho APScheduler zoneinfo (Asia/Ho_Chi_Minh) trên image tối giản
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
-    && ln -sf /usr/share/zoneinfo/Asia/Ho_Chi_Minh /etc/localtime \
-    && rm -rf /var/lib/apt/lists/*
-
+# tzdata qua pip (requirements.txt) — đủ cho zoneinfo Asia/Ho_Chi_Minh; tránh apt interactive khi build
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

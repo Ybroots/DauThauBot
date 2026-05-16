@@ -239,7 +239,8 @@ Nếu không thấy → xem **Phần H**.
 | `ModuleNotFoundError: No module named 'tracker'` | Start command: **`python run_railway.py`**. Build: **Dockerfile** (không Nixpacks). Root Directory để trống. |
 | Log có `/usr/lib/python3.10` + lỗi `importlib` | Đang chạy **Nixpacks**, không phải image Docker — đổi Builder → **DockerFILE**, Redeploy **Clear build cache**. |
 | `[run_railway] THIEU package: httpx` | Build chưa `pip install -r requirements.txt` — dùng Dockerfile hoặc xem log tab **Build**. |
-| `ZoneInfoNotFoundError: Asia/Ho_Chi_Minh` / `No module named 'tzdata'` | Image thiếu tz — repo đã thêm `tzdata` + cài `tzdata` trong Dockerfile; redeploy (clear cache). |
+| `ZoneInfoNotFoundError: Asia/Ho_Chi_Minh` / `No module named 'tzdata'` | Repo đã thêm package **`tzdata`** trong `requirements.txt`; **Redeploy + Clear build cache** để layer `pip install` chạy lại. |
+| **Build image failed** sau khi sửa Dockerfile | Thường do `apt-get install tzdata` hỏi timezone — image hiện chỉ dùng **`pip install tzdata`**, không apt. Xem tab **Build Logs** dòng đỏ cuối. |
 | `ModuleNotFoundError` (khác) | `requirements.txt` / image thiếu package — so với repo. |
 
 ---
