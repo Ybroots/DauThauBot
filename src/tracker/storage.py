@@ -327,17 +327,32 @@ def list_bids_since_hours(hours: int = 24) -> list[tuple[str, str, str, int]]:
         return [(str(r[0]), str(r[1] or ""), str(r[2]), int(r[3])) for r in cur.fetchall()]
 
 
-def list_all_groups_raw() -> list[tuple[str, str, int, list[str]]]:
-    """Tất cả groups kể cả inactive — [(name, require, active, [keywords])]."""
+def list_all_groups_raw() -> list[tuple[int, str, str, int, list[str]]]:
+    """Tất cả groups kể cả inactive — [(db_id, name, require, active, [keywords])]."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         rows = conn.execute(
             "SELECT id, name, require, active FROM keyword_groups ORDER BY active DESC, name"
         ).fetchall()
-        result: list[tuple[str, str, int, list[str]]] = []
+        result: list[tuple[int, str, str, int, list[str]]] = []
         for gid, name, require, active in rows:
             kws = [r[0] for r in conn.execute(
                 "SELECT keyword FROM keywords WHERE group_id = ?", (gid,)
             ).fetchall()]
-            result.append((str(name), str(require), int(active), kws))
+            result.append((int(gid), str(name), str(require), int(active), kws))
         return result
+
+
+def get_group_by_id(gid: int) -> tuple[str, str, list[str]] | None:
+    """Tra group theo DB id. Trả về (name, require, [keywords]) hoặc None."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        row = conn.execute(
+            "SELECT id, name, require FROM keyword_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if row is None:
+            return None
+        kws = [r[0] for r in conn.execute(
+            "SELECT keyword FROM keywords WHERE group_id = ?", (row[0],)
+        ).fetchall()]
+        return (str(row[1]), str(row[2]), kws)

@@ -26,6 +26,7 @@ from .storage import (
     count_sent_since,
     count_sent_since_hours,
     count_unsent_in_db,
+    get_group_by_id,
     init_db,
     list_all_groups_raw,
     list_bids_since_hours,
@@ -49,6 +50,7 @@ POLL_TIMEOUT = 30
 
 # Đợi user gửi từ khóa trong tin tiếp theo (scope theo Chat+User để không lẫn nhau trong nhóm)
 _await_keyword: dict[str, bool] = {}
+_await_include_closed: dict[str, bool] = {}   # True khi nút "Tìm kể cả đóng" được bấm
 _last_search_ts: dict[str, float] = {}
 
 # State cho luồng /goiy — gợi ý từ khóa có hướng dẫn
@@ -70,10 +72,19 @@ def _get_updates(token: str, offset: int | None) -> list[dict]:
     return r.json().get("result") or []
 
 
-def _reply(token: str, chat_id: int | str, text: str, *, parse_html: bool = False) -> None:
+def _reply(
+    token: str,
+    chat_id: int | str,
+    text: str,
+    *,
+    parse_html: bool = False,
+    reply_markup: Optional[dict] = None,
+) -> None:
     payload: dict = {"chat_id": chat_id, "text": text}
     if parse_html:
         payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     httpx.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json=payload,
@@ -136,6 +147,77 @@ def _cmd_and_rest(text: str) -> tuple[str, str]:
     return cmd0.lower(), rest.strip()
 
 
+# ── Inline keyboard builders ──────────────────────────────────────────────
+
+def _btn(text: str, data: str) -> dict:
+    """Inline keyboard button — callback_data capped at 64 bytes (Telegram limit)."""
+    return {"text": text, "callback_data": data.encode()[:64].decode("utf-8", errors="ignore")}
+
+
+def _kb(rows: list[list[dict]]) -> dict:
+    """Build reply_markup with inline_keyboard."""
+    return {"inline_keyboard": rows}
+
+
+def _main_menu_kb() -> dict:
+    return _kb([
+        [_btn("🔍 Tìm gói mở", "search|open"), _btn("🌐 Tìm kể cả đóng", "search|closed")],
+        [_btn("📋 Keyword Groups", "cmd|/groups"), _btn("📊 Thống kê", "cmd|/thongke")],
+        [_btn("🕐 Gói hôm nay (24h)", "cmd|/timhom"), _btn("📜 Lịch sử gần đây", "cmd|/lichsu")],
+    ])
+
+
+def _after_search_kb(include_closed: bool = False) -> dict:
+    if include_closed:
+        row1 = [_btn("🌐 Tìm lại (tất cả)", "search|closed"), _btn("🔍 Chỉ gói mở", "search|open")]
+    else:
+        row1 = [_btn("🔍 Tìm lại", "search|open"), _btn("🌐 Tìm kể cả đóng", "search|closed")]
+    return _kb([row1, [_btn("📋 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]])
+
+
+def _groups_kb(all_raw: list[tuple]) -> dict:
+    """Keyboard for /groups list — each group gets a quick-search button."""
+    rows: list[list[dict]] = []
+    for entry in all_raw[:10]:  # limit to 10 to avoid oversized keyboard
+        gid = entry[0]
+        name = entry[1]
+        active = entry[3]
+        icon = "▶" if active else "⏸"
+        label = f"{icon} {name}"
+        if len(label.encode("utf-8")) > 32:
+            label = label[:28] + "…"
+        rows.append([_btn(label, f"grp|{gid}")])
+    rows.append([_btn("➕ Hướng dẫn thêm group", "hint|addgroup"), _btn("🏠 Menu", "menu")])
+    return _kb(rows)
+
+
+def _suggest_kb(suggestions: list[tuple[str, int]]) -> dict:
+    """Keyboard for /goiy suggestions — numbered buttons + taogroup/huy."""
+    rows: list[list[dict]] = []
+    for i, (term, count) in enumerate(suggestions):
+        label = f"{i + 1}. {term} ({count})"
+        if len(label.encode("utf-8")) > 50:
+            label = f"{i + 1}. {term[:18]}… ({count})"
+        rows.append([_btn(label, f"sug|{i}")])  # index-based, no encoding issue
+    rows.append([_btn("✅ Tạo group AND", "taogroup"), _btn("❌ Hủy", "huy")])
+    return _kb(rows)
+
+
+def _answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
+    """Acknowledge a callback_query (required within 10s or Telegram shows spinner)."""
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=8,
+        )
+    except Exception:
+        pass  # Non-fatal — user sees spinner briefly but bot continues
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _execute_search(
     secrets: Secrets,
     phrases: list[str],
@@ -179,7 +261,12 @@ def _execute_search(
             total,
         )
         _mark_search_done(chat_scope_key)
-        _reply(secrets.telegram_bot_token, target_chat_id, summary)
+        _reply(
+            secrets.telegram_bot_token,
+            target_chat_id,
+            summary,
+            reply_markup=_after_search_kb(include_closed),
+        )
     except BlockedException as e:
         _reply(
             secrets.telegram_bot_token,
@@ -326,13 +413,13 @@ def handle_slash(
             header += f", {inactive_n} tắt"
         header += "):"
         lines = [header]
-        for i, (name, require, active, kws) in enumerate(all_groups, 1):
+        for i, (gid, name, require, active, kws) in enumerate(all_groups, 1):
             req = "TẤT CẢ — AND" if require == "all" else "BẤT KỲ — OR"
             sep = " + " if require == "all" else " | "
             kws_str = sep.join(kws) if kws else "(trống)"
             status = "" if active else " [tắt]"
             lines.append(f"{i}. {name}{status} [{req}]\n   {kws_str}")
-        lines.append("\n/addgroup /removegroup /addkw /removekw /renamegroup /tatgroup /batgroup /timgroup")
+        lines.append("\nBấm nút bên dưới để tìm ngay theo từng group:")
         return "\n".join(lines)
 
     if cmd == "/addgroup":
@@ -624,8 +711,9 @@ def process_message(secrets: Secrets, msg: dict) -> None:
 
     if cmd in ("/huy", "/hủy", "/cancel"):
         _await_keyword.pop(ukey, None)
+        _await_include_closed.pop(ukey, None)
         _suggest_state.pop(ukey, None)
-        _reply(bot_token, chat_id, "Đã hủy.")
+        _reply(bot_token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
         return
 
     if cmd in ("/goiy", "/suggest"):
@@ -678,7 +766,12 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             "bids": bids,
             "suggestions": suggestions,
         }
-        _reply(bot_token, chat_id, build_suggest_reply(bids, [seed], suggestions))
+        _reply(
+            bot_token,
+            chat_id,
+            build_suggest_reply(bids, [seed], suggestions),
+            reply_markup=_suggest_kb(suggestions),
+        )
         return
 
     if cmd in ("/tim", "/timkiem", "/search"):
@@ -739,17 +832,17 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         init_db()
         all_raw = list_all_groups_raw()  # kể cả inactive
         matched_g = next(
-            (g for g in all_raw if g[0] == name),
+            (g for g in all_raw if g[1] == name),  # g[1] = name (gid is g[0])
             None,
         )
         if matched_g is None:
             # thử tìm case-insensitive
             name_lower = name.lower()
-            matched_g = next((g for g in all_raw if g[0].lower() == name_lower), None)
+            matched_g = next((g for g in all_raw if g[1].lower() == name_lower), None)
         if matched_g is None:
             _reply(bot_token, chat_id, f'Không tìm thấy group "{name}". Xem /groups.')
             return
-        g_name, g_require, g_active, g_kws = matched_g
+        _gid, g_name, g_require, g_active, g_kws = matched_g
         if not g_kws:
             _reply(bot_token, chat_id, f'Group "{g_name}" không có từ khóa nào. Dùng /addkw.')
             return
@@ -770,7 +863,29 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         user_id=int(uid),
     )
     if routed:
-        _reply(bot_token, chat_id, routed, parse_html=cmd in ("/id", "/ma", "/xem", "/lookup"))
+        parse_html_cmds = ("/id", "/ma", "/xem", "/lookup")
+        kb: Optional[dict] = None
+        if cmd in ("/start", "/help", "/gioithieu", "/lenh", "/commands"):
+            kb = _main_menu_kb()
+        elif cmd in ("/thongke", "/dashboard"):
+            kb = _kb([
+                [_btn("📜 Lịch sử", "cmd|/lichsu"), _btn("📭 Chưa gửi", "cmd|/chuagui")],
+                [_btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
+            ])
+        elif cmd in ("/groups", "/keywords"):
+            init_db()
+            kb = _groups_kb(list_all_groups_raw())
+        elif cmd in ("/lichsu", "/recent"):
+            kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+        elif cmd in ("/chuagui", "/unsent"):
+            kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+        _reply(
+            bot_token,
+            chat_id,
+            routed,
+            parse_html=cmd in parse_html_cmds,
+            reply_markup=kb,
+        )
         return
 
     if cmd:
@@ -805,7 +920,8 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                     bot_token, chat_id,
                     f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\n'
                     f"Không còn gói nào khớp đủ {len(accumulated)} điều kiện trong dữ liệu đã cào.\n"
-                    "Gõ /taogroup để tạo group AND ngay, hoặc /hủy.",
+                    "Bấm nút hoặc gõ /taogroup để tạo group AND.",
+                    reply_markup=_kb([[_btn("✅ Tạo group AND", "taogroup"), _btn("❌ Hủy", "huy")]]),
                 )
                 state["suggestions"] = []
                 return
@@ -819,8 +935,8 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                 _reply(
                     bot_token, chat_id,
                     f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\n'
-                    f"Còn {len(filtered)} gói khớp. Không còn từ để gợi thêm.\n"
-                    "Gõ /taogroup để tạo group AND, hoặc /hủy.",
+                    f"Còn {len(filtered)} gói khớp. Không còn từ để gợi thêm.",
+                    reply_markup=_kb([[_btn("✅ Tạo group AND", "taogroup"), _btn("❌ Hủy", "huy")]]),
                 )
                 return
 
@@ -828,7 +944,7 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                 f'✅ Thêm "{chosen_term}". '
                 + build_suggest_reply(filtered, accumulated, new_suggestions)
             )
-            _reply(bot_token, chat_id, reply)
+            _reply(bot_token, chat_id, reply, reply_markup=_suggest_kb(new_suggestions))
             return
         # Không phải số → bỏ qua suggest state, xử lý bình thường bên dưới
 
@@ -837,8 +953,9 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         if not phrases:
             _reply(bot_token, chat_id, "Chưa có từ khóa. Ví dụ: camera  hoặc  camera & lâm đồng (AND). /hủy để thoát.")
             return
+        inc_closed = _await_include_closed.pop(ukey, False)
         _await_keyword.pop(ukey, None)
-        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode)
+        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode, include_closed=inc_closed)
         return
 
     stripped = text.strip()
@@ -864,6 +981,175 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode)
 
 
+def process_callback_query(secrets: Secrets, cq: dict) -> None:
+    """Xử lý inline button callback_query."""
+    cq_id = cq.get("id") or ""
+    data = (cq.get("data") or "").strip()
+    msg = cq.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    frm = cq.get("from") or {}
+    uid = frm.get("id")
+
+    if not chat_id or not uid:
+        return
+
+    token = secrets.telegram_bot_token
+    cid_s = str(chat_id)
+    ukey = _state_key(chat_id, int(uid))
+
+    # Acknowledge immediately — Telegram requires answerCallbackQuery within 10s
+    _answer_callback(token, cq_id)
+
+    # ── menu ─────────────────────────────────────────────────────────────
+    if data == "menu":
+        _reply(token, chat_id, "Menu chính:", reply_markup=_main_menu_kb())
+        return
+
+    # ── cmd|/lệnh — chạy lệnh và trả kết quả kèm keyboard ───────────────
+    if data.startswith("cmd|"):
+        cmd_str = data[4:]
+        cmd_key = cmd_str.split()[0].lower()
+        routed = handle_slash(cmd_str, secrets, chat.get("type"), chat_id=chat_id, user_id=int(uid))
+        if routed:
+            kb: Optional[dict] = None
+            if cmd_key in ("/thongke", "/dashboard"):
+                kb = _kb([
+                    [_btn("📜 Lịch sử", "cmd|/lichsu"), _btn("📭 Chưa gửi", "cmd|/chuagui")],
+                    [_btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
+                ])
+            elif cmd_key in ("/groups", "/keywords"):
+                init_db()
+                kb = _groups_kb(list_all_groups_raw())
+            elif cmd_key in ("/lichsu", "/recent", "/chuagui", "/unsent", "/timhom", "/today"):
+                kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+            _reply(
+                token,
+                chat_id,
+                routed,
+                parse_html=cmd_key in ("/id", "/ma", "/xem", "/lookup"),
+                reply_markup=kb,
+            )
+        return
+
+    # ── search|open / search|closed — đặt trạng thái chờ từ khóa ─────────
+    if data.startswith("search|"):
+        inc_closed = data[7:] == "closed"
+        _await_keyword[ukey] = True
+        _await_include_closed[ukey] = inc_closed
+        prefix = "[Tìm tất cả — kể cả đã đóng]\n\n" if inc_closed else ""
+        _reply(
+            token, chat_id,
+            f"{prefix}Gõ từ khóa cần tìm:\n\n"
+            "  camera\n"
+            "  camera & lâm đồng   (AND — tất cả phải khớp)\n"
+            "  camera | cctv       (OR — bất kỳ khớp)\n\n"
+            "Hoặc tên cơ quan: Công an tỉnh Lâm Đồng\n"
+            "/hủy để thoát.",
+            reply_markup=_kb([[_btn("❌ Hủy", "huy")]]),
+        )
+        return
+
+    # ── grp|<db_id> — tra ngay bằng một keyword group ────────────────────
+    if data.startswith("grp|"):
+        try:
+            gid = int(data[4:])
+        except ValueError:
+            _reply(token, chat_id, "Nút không hợp lệ.")
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        if row is None:
+            _reply(token, chat_id, "Không tìm thấy group — có thể đã bị xóa. Xem /groups.")
+            return
+        g_name, g_require, g_kws = row
+        if not g_kws:
+            _reply(token, chat_id, f'Group "{g_name}" không có từ khóa. Dùng /addkw.')
+            return
+        _reply(token, chat_id, f'Đang tra group "{g_name}" ({len(g_kws)} từ khóa)…')
+        _execute_search(secrets, g_kws, chat_id, cid_s, mode=g_require)
+        return
+
+    # ── sug|<idx> — chọn gợi ý trong luồng /goiy ─────────────────────────
+    if data.startswith("sug|"):
+        if ukey not in _suggest_state:
+            _reply(token, chat_id, "Phiên /goiy đã hết hạn. Dùng /goiy để bắt đầu lại.")
+            return
+        try:
+            idx = int(data[4:])
+        except ValueError:
+            _reply(token, chat_id, "Nút không hợp lệ.")
+            return
+        state = _suggest_state[ukey]
+        suggestions = state.get("suggestions", [])
+        if idx < 0 or idx >= len(suggestions):
+            _reply(token, chat_id, "Lựa chọn không còn hợp lệ. Dùng /goiy lại.")
+            return
+        chosen_term, _ = suggestions[idx]
+        state["accumulated"].append(chosen_term)
+        accumulated = state["accumulated"]
+        filtered = filter_bids_by_terms(state["bids"], accumulated)
+
+        if not filtered:
+            kw_str = " + ".join(f'"{k}"' for k in accumulated)
+            _reply(
+                token, chat_id,
+                f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\n'
+                f"Không còn gói nào khớp đủ {len(accumulated)} điều kiện.",
+                reply_markup=_kb([[_btn("✅ Tạo group AND", "taogroup"), _btn("❌ Hủy", "huy")]]),
+            )
+            state["suggestions"] = []
+            return
+
+        new_suggestions = extract_suggestions(filtered, accumulated=accumulated)
+        state["bids"] = filtered
+        state["suggestions"] = new_suggestions
+
+        if not new_suggestions:
+            kw_str = " + ".join(f'"{k}"' for k in accumulated)
+            _reply(
+                token, chat_id,
+                f'✅ Thêm "{chosen_term}". Từ đã chọn: {kw_str}\n\nCòn {len(filtered)} gói khớp. Không còn từ gợi thêm.',
+                reply_markup=_kb([[_btn("✅ Tạo group AND", "taogroup"), _btn("❌ Hủy", "huy")]]),
+            )
+            return
+
+        reply_text = f'✅ Thêm "{chosen_term}". ' + build_suggest_reply(filtered, accumulated, new_suggestions)
+        _reply(token, chat_id, reply_text, reply_markup=_suggest_kb(new_suggestions))
+        return
+
+    # ── taogroup ─────────────────────────────────────────────────────────
+    if data == "taogroup":
+        routed = handle_slash("/taogroup", secrets, None, chat_id=chat_id, user_id=int(uid))
+        if routed:
+            _reply(token, chat_id, routed, reply_markup=_main_menu_kb())
+        return
+
+    # ── huy ──────────────────────────────────────────────────────────────
+    if data == "huy":
+        _await_keyword.pop(ukey, None)
+        _await_include_closed.pop(ukey, None)
+        _suggest_state.pop(ukey, None)
+        _reply(token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
+        return
+
+    # ── hint|addgroup ─────────────────────────────────────────────────────
+    if data == "hint|addgroup":
+        _reply(
+            token, chat_id,
+            "Cú pháp tạo keyword group:\n\n"
+            "AND (tất cả phải khớp):\n"
+            "  /addgroup Camera LĐ | all | camera, lâm đồng\n\n"
+            "OR (bất kỳ khớp):\n"
+            "  /addgroup Camera | any | camera, cctv, giám sát\n\n"
+            "Hoặc dùng /goiy để gợi ý từ khóa từ dữ liệu thực.",
+            reply_markup=_kb([[_btn("🔙 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]]),
+        )
+        return
+
+    logger.debug("Unhandled callback_data: {!r}", data)
+
+
 def poll_loop() -> None:
     secrets = Secrets()
     init_db()
@@ -881,13 +1167,16 @@ def poll_loop() -> None:
             updates = _get_updates(secrets.telegram_bot_token, offset)
             for upd in updates:
                 offset = upd["update_id"] + 1
-                msg = upd.get("message")
-                if not msg:
-                    continue
-                try:
-                    process_message(secrets, msg)
-                except Exception:
-                    logger.exception("Unhandled in process_message")
+                if msg := upd.get("message"):
+                    try:
+                        process_message(secrets, msg)
+                    except Exception:
+                        logger.exception("Unhandled in process_message")
+                elif cq := upd.get("callback_query"):
+                    try:
+                        process_callback_query(secrets, cq)
+                    except Exception:
+                        logger.exception("Unhandled in process_callback_query")
         except httpx.HTTPError as e:
             logger.warning("getUpdates: {}", e)
             time.sleep(5)
