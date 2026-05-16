@@ -7,9 +7,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     DATA_DIR=/data
 
-# Không cài playwright qua pip — dùng bản trong image v1.49.0-jammy
 COPY requirements-docker.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "from playwright.sync_api import sync_playwright; print('playwright import ok')"
 
 COPY BUILD_STAMP run_railway.py pyproject.toml README.md ./
 COPY config ./config
