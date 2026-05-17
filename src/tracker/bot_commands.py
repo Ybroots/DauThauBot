@@ -61,6 +61,10 @@ _suggest_state: dict[str, dict] = {}
 # { state_key: { "fields": list[str], "method": int|None, "closed": bool } }
 _filter_state: dict[str, dict] = {}
 
+# State cho thao tác nhập liệu với group (addkw)
+# { state_key: { "action": str, "gid": int, "name": str } }
+_await_group_action: dict[str, dict] = {}
+
 # Lĩnh vực đấu thầu — mã ES và tên hiển thị
 FIELD_OPTIONS: list[tuple[str, str]] = [
     ("HH", "Hàng hóa"),
@@ -68,6 +72,22 @@ FIELD_OPTIONS: list[tuple[str, str]] = [
     ("TV", "Tư vấn"),
     ("PTV", "Phi tư vấn"),
     ("HON_HOP", "Hỗn hợp"),
+]
+
+# Tỉnh/TP nhanh — (nhãn nút, từ khóa tìm kiếm ES)
+PROVINCE_QUICK: list[tuple[str, str]] = [
+    ("Hà Nội", "Hà Nội"),
+    ("TP.HCM", "Hồ Chí Minh"),
+    ("Đà Nẵng", "Đà Nẵng"),
+    ("Hải Phòng", "Hải Phòng"),
+    ("Cần Thơ", "Cần Thơ"),
+    ("Lâm Đồng", "Lâm Đồng"),
+    ("Nghệ An", "Nghệ An"),
+    ("Bình Dương", "Bình Dương"),
+    ("Đồng Nai", "Đồng Nai"),
+    ("Thanh Hóa", "Thanh Hóa"),
+    ("Khánh Hòa", "Khánh Hòa"),
+    ("Bình Định", "Bình Định"),
 ]
 
 
@@ -250,19 +270,80 @@ def _show_loc_panel(token: str, chat_id: int | str, fstate: dict) -> None:
 
 
 def _groups_kb(all_raw: list[tuple]) -> dict:
-    """Keyboard for /groups list — each group gets a quick-search button."""
+    """Keyboard for /groups list — tap group to open detail panel."""
     rows: list[list[dict]] = []
-    for entry in all_raw[:10]:  # limit to 10 to avoid oversized keyboard
+    for entry in all_raw[:12]:
         gid = entry[0]
         name = entry[1]
         active = entry[3]
         icon = "▶" if active else "⏸"
         label = f"{icon} {name}"
-        if len(label.encode("utf-8")) > 32:
-            label = label[:28] + "…"
+        if len(label.encode("utf-8")) > 48:
+            label = label[:38] + "…"
         rows.append([_btn(label, f"grp|{gid}")])
-    rows.append([_btn("➕ Hướng dẫn thêm group", "hint|addgroup"), _btn("🏠 Menu", "menu")])
+    rows.append([_btn("➕ Tạo group mới", "hint|addgroup"), _btn("🏠 Menu", "menu")])
     return _kb(rows)
+
+
+def _group_detail_kb(gid: int, active: bool) -> dict:
+    """Keyboard for a single group's detail panel."""
+    tgl_label = "⏸ Tắt group" if active else "▶ Bật group"
+    return _kb([
+        [_btn("🔍 Tìm gói mở", f"grpsearch|{gid}"), _btn("🌐 Tìm cả đóng", f"grpsearchclosed|{gid}")],
+        [_btn(tgl_label, f"grptgl|{gid}"), _btn("➕ Thêm từ khóa", f"grpadkw|{gid}")],
+        [_btn("🗑 Xóa group", f"grpdel|{gid}"), _btn("🔙 Danh sách groups", "cmd|/groups")],
+    ])
+
+
+def _search_prompt_kb(include_closed: bool) -> dict:
+    """Province quick-pick keyboard shown alongside search keyword prompt."""
+    scope = "c" if include_closed else "o"
+    rows: list[list[dict]] = []
+    row: list[dict] = []
+    for i, (name, _) in enumerate(PROVINCE_QUICK):
+        row.append(_btn(name, f"qs|{i}|{scope}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([_btn("🔧 Bộ lọc nâng cao", "cmd|/loc"), _btn("❌ Hủy", "huy")])
+    return _kb(rows)
+
+
+def _timhom_kb() -> dict:
+    """Time-range picker for /timhom."""
+    return _kb([
+        [_btn("1h", "timhom|1"), _btn("3h", "timhom|3"), _btn("6h", "timhom|6"), _btn("12h", "timhom|12")],
+        [_btn("24h", "timhom|24"), _btn("48h", "timhom|48"), _btn("72h", "timhom|72"), _btn("7 ngày", "timhom|168")],
+        [_btn("📊 Thống kê", "cmd|/thongke"), _btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
+    ])
+
+
+def _show_group_detail(token: str, chat_id: int | str, gid: int) -> None:
+    """Gửi chi tiết một keyword group kèm nút quản lý."""
+    init_db()
+    row = get_group_by_id(gid)
+    if row is None:
+        _reply(token, chat_id, "Không tìm thấy group — có thể đã bị xóa.",
+               reply_markup=_kb([[_btn("📋 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]]))
+        return
+    g_name, g_require, g_kws = row
+    all_groups = list_all_groups_raw()
+    g_active = next((g[3] for g in all_groups if g[0] == gid), True)
+    req_label = "AND — tất cả phải khớp" if g_require == "all" else "OR — bất kỳ khớp"
+    sep = " + " if g_require == "all" else " | "
+    kws_str = sep.join(g_kws) if g_kws else "(trống — dùng nút Thêm từ khóa)"
+    status = "▶ Đang bật" if g_active else "⏸ Đang tắt (cron bỏ qua)"
+    text = (
+        f"📋 {g_name}\n"
+        f"Kiểu khớp: {req_label}\n"
+        f"Trạng thái: {status}\n\n"
+        f"Từ khóa ({len(g_kws)}):\n"
+        f"  {kws_str}\n\n"
+        "Chọn thao tác:"
+    )
+    _reply(token, chat_id, text, reply_markup=_group_detail_kb(gid, bool(g_active)))
 
 
 def _suggest_kb(suggestions: list[tuple[str, int]]) -> dict:
@@ -477,7 +558,14 @@ def handle_slash(
     """Trả text trả lời (plain) hoặc None nếu đã xử lý không cần gửi thêm."""
     cmd, rest = _cmd_and_rest(full_text)
 
-    if cmd in ("/start", "/help", "/gioithieu"):
+    if cmd == "/start":
+        return (
+            "Chào mừng đến với DauThauBot!\n\n"
+            "Bot tự động theo dõi đấu thầu trên muasamcong.mpi.gov.vn.\n"
+            "Dùng nút Menu bên dưới để bắt đầu, hoặc /help xem hướng dẫn đầy đủ."
+        )
+
+    if cmd in ("/help", "/gioithieu"):
         return HELP_VI()
 
     if cmd in ("/lenh", "/commands"):
@@ -819,6 +907,7 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _await_include_closed.pop(ukey, None)
         _suggest_state.pop(ukey, None)
         _filter_state.pop(ukey, None)
+        _await_group_action.pop(ukey, None)
         _reply(bot_token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
         return
 
@@ -1018,7 +1107,10 @@ def process_message(secrets: Secrets, msg: dict) -> None:
                 [_btn("🔍 Tìm TBMT", "search|open"), _btn("🏠 Menu", "menu")],
             ])
         elif cmd in _data_cmds:
-            kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
+            if cmd in ("/timhom", "/today"):
+                kb = _timhom_kb()
+            else:
+                kb = _kb([[_btn("📊 Thống kê", "cmd|/thongke"), _btn("🏠 Menu", "menu")]])
         elif cmd in _menu_cmds:
             kb = _main_menu_kb()
         _reply(
@@ -1093,6 +1185,26 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             _reply(bot_token, chat_id, reply, reply_markup=_suggest_kb(new_suggestions))
             return
         # Không phải số → bỏ qua suggest state, xử lý bình thường bên dưới
+
+    # ── xử lý nhập liệu cho thao tác group (addkw) ──────────────────────────
+    if ukey in _await_group_action:
+        gact = _await_group_action.pop(ukey)
+        keyword_input = text.strip()
+        if not keyword_input or keyword_input == "/hủy":
+            _reply(bot_token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
+            return
+        if gact.get("action") == "addkw":
+            gid_act = gact["gid"]
+            gname_act = gact["name"]
+            init_db()
+            ok = add_keyword_to_group(gname_act, keyword_input)
+            if ok:
+                _reply(bot_token, chat_id, f'✅ Đã thêm "{keyword_input}" vào group "{gname_act}"')
+            else:
+                _reply(bot_token, chat_id,
+                       f'Không thêm được "{keyword_input}" — từ khóa đã tồn tại hoặc group không tìm thấy.')
+            _show_group_detail(bot_token, chat_id, gid_act)
+        return
 
     if _await_keyword.get(ukey):
         raw_text = text.strip()
@@ -1186,6 +1298,25 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
         _show_loc_panel(token, chat_id, fstate)
         return
 
+    # ── cmd|/timhom — hiện gói 24h + bộ chọn khung giờ ──────────────────
+    if data == "cmd|/timhom":
+        init_db()
+        rows = list_bids_since_hours(24)
+        if not rows:
+            _reply(token, chat_id, "Không thấy gói nào trong 24 giờ vừa qua.", reply_markup=_timhom_kb())
+        else:
+            lines = []
+            for code, title, seen_at, sent in rows:
+                flag = "✅" if sent else "⏳"
+                short_time = seen_at[11:16] if len(seen_at) >= 16 else ""
+                lines.append(f"{flag} {short_time}  {_truncate(title, 52)}\n   {code}")
+            _reply(
+                token, chat_id,
+                f"Gói thấy trong 24 giờ ({len(rows)} gói):\n\n" + "\n".join(lines),
+                reply_markup=_timhom_kb(),
+            )
+        return
+
     # ── cmd|/lệnh — chạy lệnh và trả kết quả kèm keyboard ───────────────
     if data.startswith("cmd|"):
         cmd_str = data[4:]
@@ -1219,42 +1350,207 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
             )
         return
 
-    # ── search|open / search|closed — đặt trạng thái chờ từ khóa ─────────
+    # ── search|open / search|closed — prompt với tỉnh/TP nhanh ─────────────
     if data.startswith("search|"):
         inc_closed = data[7:] == "closed"
         _await_keyword[ukey] = True
         _await_include_closed[ukey] = inc_closed
-        prefix = "[Tìm tất cả — kể cả đã đóng]\n\n" if inc_closed else ""
+        scope_tag = "[Tìm tất cả — kể cả đã đóng]\n\n" if inc_closed else ""
         _reply(
             token, chat_id,
-            f"{prefix}Gõ từ khóa cần tìm:\n\n"
+            f"{scope_tag}Gõ từ khóa hoặc chọn nhanh tỉnh/TP bên dưới:\n\n"
             "  camera\n"
             "  camera & lâm đồng   (AND — tất cả phải khớp)\n"
-            "  camera | cctv       (OR — bất kỳ khớp)\n\n"
-            "Hoặc tên cơ quan: Công an tỉnh Lâm Đồng\n"
-            "/hủy để thoát.",
-            reply_markup=_kb([[_btn("❌ Hủy", "huy")]]),
+            "  camera | cctv       (OR — bất kỳ khớp)\n"
+            "  Công an tỉnh Lâm Đồng   (tên cơ quan)\n",
+            reply_markup=_search_prompt_kb(inc_closed),
         )
         return
 
-    # ── grp|<db_id> — tra ngay bằng một keyword group ────────────────────
-    if data.startswith("grp|"):
+    # ── grp|<db_id> — mở chi tiết group ─────────────────────────────────
+    if data.startswith("grp|") and "|" not in data[4:]:
         try:
             gid = int(data[4:])
         except ValueError:
             _reply(token, chat_id, "Nút không hợp lệ.")
             return
+        _show_group_detail(token, chat_id, gid)
+        return
+
+    # ── grpsearch|<gid> — tra ngay group (gói mở) ────────────────────────
+    if data.startswith("grpsearch|") and not data.startswith("grpsearchclosed|"):
+        try:
+            gid = int(data[10:])
+        except ValueError:
+            return
         init_db()
         row = get_group_by_id(gid)
         if row is None:
-            _reply(token, chat_id, "Không tìm thấy group — có thể đã bị xóa. Xem /groups.")
+            _reply(token, chat_id, "Không tìm thấy group.")
             return
         g_name, g_require, g_kws = row
         if not g_kws:
-            _reply(token, chat_id, f'Group "{g_name}" không có từ khóa. Dùng /addkw.')
+            _reply(token, chat_id, f'Group "{g_name}" chưa có từ khóa. Dùng nút Thêm từ khóa.',
+                   reply_markup=_group_detail_kb(gid, True))
             return
-        _reply(token, chat_id, f'Đang tra group "{g_name}" ({len(g_kws)} từ khóa)…')
+        _reply(token, chat_id, f'Đang tra group "{g_name}" — {len(g_kws)} từ khóa (gói mở)…')
         _execute_search(secrets, g_kws, chat_id, cid_s, mode=g_require)
+        return
+
+    # ── grpsearchclosed|<gid> — tra group kể cả đã đóng ─────────────────
+    if data.startswith("grpsearchclosed|"):
+        try:
+            gid = int(data[16:])
+        except ValueError:
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        if row is None:
+            _reply(token, chat_id, "Không tìm thấy group.")
+            return
+        g_name, g_require, g_kws = row
+        if not g_kws:
+            _reply(token, chat_id, f'Group "{g_name}" chưa có từ khóa.')
+            return
+        _reply(token, chat_id, f'Đang tra group "{g_name}" — {len(g_kws)} từ khóa (kể cả đóng)…')
+        _execute_search(secrets, g_kws, chat_id, cid_s, mode=g_require, include_closed=True)
+        return
+
+    # ── grptgl|<gid> — bật/tắt group ────────────────────────────────────
+    if data.startswith("grptgl|"):
+        try:
+            gid = int(data[7:])
+        except ValueError:
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        if row is None:
+            _reply(token, chat_id, "Không tìm thấy group.")
+            return
+        g_name, _, _ = row
+        all_groups = list_all_groups_raw()
+        g_active = next((g[3] for g in all_groups if g[0] == gid), True)
+        new_active = not bool(g_active)
+        toggle_group_active(g_name, new_active)
+        status_msg = "▶ Đã bật" if new_active else "⏸ Đã tắt"
+        _answer_callback(token, cq_id, f'{status_msg} group "{g_name}"')
+        _show_group_detail(token, chat_id, gid)
+        return
+
+    # ── grpdel|<gid> — xác nhận xóa group ───────────────────────────────
+    if data.startswith("grpdel|") and not data.startswith("grpdelok|"):
+        try:
+            gid = int(data[7:])
+        except ValueError:
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        if row is None:
+            _reply(token, chat_id, "Group không còn tồn tại.")
+            return
+        g_name = row[0]
+        _reply(
+            token, chat_id,
+            f'❗ Xác nhận xóa group "{g_name}"?\n\nThao tác này không thể hoàn tác.',
+            reply_markup=_kb([
+                [_btn("✅ Xóa", f"grpdelok|{gid}"), _btn("❌ Hủy", f"grp|{gid}")],
+            ]),
+        )
+        return
+
+    # ── grpdelok|<gid> — thực hiện xóa group ────────────────────────────
+    if data.startswith("grpdelok|"):
+        try:
+            gid = int(data[9:])
+        except ValueError:
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        g_name = row[0] if row else f"#{gid}"
+        ok = remove_group(g_name)
+        if ok:
+            _reply(
+                token, chat_id,
+                f'🗑 Đã xóa group "{g_name}".',
+                reply_markup=_kb([[_btn("📋 Xem groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]]),
+            )
+        else:
+            _reply(token, chat_id, f'Không tìm thấy group "{g_name}" để xóa.',
+                   reply_markup=_kb([[_btn("📋 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]]))
+        return
+
+    # ── grpadkw|<gid> — nhập từ khóa mới để thêm vào group ──────────────
+    if data.startswith("grpadkw|"):
+        try:
+            gid = int(data[8:])
+        except ValueError:
+            return
+        init_db()
+        row = get_group_by_id(gid)
+        if row is None:
+            _reply(token, chat_id, "Không tìm thấy group.")
+            return
+        g_name = row[0]
+        _await_group_action[ukey] = {"action": "addkw", "gid": gid, "name": g_name}
+        _reply(
+            token, chat_id,
+            f'Gõ từ khóa muốn thêm vào group "{g_name}":',
+            reply_markup=_kb([[_btn("❌ Hủy", "huy")]]),
+        )
+        return
+
+    # ── qs|<idx>|<scope> — tìm nhanh theo tỉnh/TP ───────────────────────
+    if data.startswith("qs|"):
+        parts = data.split("|")
+        if len(parts) < 3:
+            return
+        try:
+            idx = int(parts[1])
+        except ValueError:
+            return
+        scope = parts[2]
+        include_closed = scope == "c"
+        if 0 <= idx < len(PROVINCE_QUICK):
+            _name, kw = PROVINCE_QUICK[idx]
+            _await_keyword.pop(ukey, None)
+            _await_include_closed.pop(ukey, None)
+            _filter_state.pop(ukey, None)
+            _execute_search(secrets, [kw], chat_id, cid_s, include_closed=include_closed)
+        else:
+            _reply(token, chat_id, "Lựa chọn không hợp lệ.")
+        return
+
+    # ── timhom|<hours> — xem gói theo khoảng giờ ────────────────────────
+    if data.startswith("timhom|"):
+        try:
+            hours = int(data[7:])
+        except ValueError:
+            hours = 24
+        hours = max(1, min(hours, 720))
+        init_db()
+        rows = list_bids_since_hours(hours)
+        if hours < 24:
+            h_label = f"{hours} giờ"
+        elif hours == 24:
+            h_label = "24 giờ"
+        elif hours % 24 == 0:
+            h_label = f"{hours // 24} ngày"
+        else:
+            h_label = f"{hours} giờ"
+        if not rows:
+            _reply(token, chat_id, f"Không thấy gói nào trong {h_label} vừa qua.",
+                   reply_markup=_timhom_kb())
+            return
+        lines = []
+        for code, title, seen_at, sent in rows:
+            flag = "✅" if sent else "⏳"
+            short_time = seen_at[11:16] if len(seen_at) >= 16 else ""
+            lines.append(f"{flag} {short_time}  {_truncate(title, 52)}\n   {code}")
+        _reply(
+            token, chat_id,
+            f"Gói thấy trong {h_label} ({len(rows)} gói):\n\n" + "\n".join(lines),
+            reply_markup=_timhom_kb(),
+        )
         return
 
     # ── sug|<idx> — chọn gợi ý trong luồng /goiy ─────────────────────────
@@ -1318,6 +1614,7 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
         _await_include_closed.pop(ukey, None)
         _suggest_state.pop(ukey, None)
         _filter_state.pop(ukey, None)
+        _await_group_action.pop(ukey, None)
         _reply(token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
         return
 
