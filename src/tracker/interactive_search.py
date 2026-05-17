@@ -3,16 +3,61 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
+from typing import Any
 
 from loguru import logger
 
 from .config import KeywordGroup, KeywordsConfig, Secrets
 from .crawler import MuasamcongCrawler
-from .filter import match_bid
+from .filter import _build_haystack, normalize, match_bid
 from .models import Bid
 from .formatter import format_bid_message
 from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, send_message
+
+# ── TTL in-memory result cache (5 min) ───────────────────────────────────────
+_CACHE_TTL_S = 300  # seconds
+_bid_cache: dict[str, tuple[float, list[Bid]]] = {}
+_cache_lock = threading.Lock()
+
+
+def _make_cache_key(
+    phrases: list[str],
+    mode: str,
+    include_closed: bool,
+    field_filter: list[str] | None,
+    bid_method_filter: int | None,
+    max_pages: int,
+) -> str:
+    parts = [
+        "|".join(sorted(phrases)),
+        mode,
+        "closed" if include_closed else "open",
+        ",".join(sorted(field_filter or [])),
+        str(bid_method_filter) if bid_method_filter is not None else "all",
+        str(max_pages),
+    ]
+    return "::".join(parts)
+
+
+def _cache_get(key: str) -> list[Bid] | None:
+    with _cache_lock:
+        entry = _bid_cache.get(key)
+        if entry is None:
+            return None
+        ts, bids = entry
+        if time.time() - ts > _CACHE_TTL_S:
+            del _bid_cache[key]
+            return None
+        logger.info("interactive_cache: HIT ({} bids, age {:.0f}s)", len(bids), time.time() - ts)
+        return bids
+
+
+def _cache_put(key: str, bids: list[Bid]) -> None:
+    with _cache_lock:
+        _bid_cache[key] = (time.time(), bids)
+        logger.info("interactive_cache: stored {} bids", len(bids))
 
 
 def parse_keyword_phrases(raw: str) -> list[str]:
@@ -44,6 +89,21 @@ def parse_search_query(raw: str) -> tuple[list[str], str]:
     return parse_keyword_phrases(raw), "any"
 
 
+def _relevance_score(bid: Bid, phrases: list[str], strict: bool) -> tuple[int, int]:
+    """Returns (matched_phrase_count, title_match_count) for relevance sorting (higher = better)."""
+    haystack = _build_haystack(bid)
+    title_norm = normalize(bid.title or "")
+    phrase_hits = 0
+    title_hits = 0
+    for ph in phrases:
+        n = normalize(ph)
+        if n and n in haystack:
+            phrase_hits += 1
+            if n in title_norm:
+                title_hits += 1
+    return phrase_hits, title_hits
+
+
 def run_interactive_keyword_search(
     secrets: Secrets,
     phrases: list[str],
@@ -54,21 +114,18 @@ def run_interactive_keyword_search(
     field_filter: list[str] | None = None,
     bid_method_filter: int | None = None,
 ) -> tuple[int, int, str]:
-    """Cào theo crawl_max_pages của .env; gửi tối đa N tin HTML tới một chat.
+    """Cào theo interactive_fetch_max_pages; gửi tối đa N tin HTML tới một chat.
 
-    mode="any"        → OR: bid khớp ít nhất 1 phrase (hành vi mặc định)
-    mode="all"        → AND: bid phải chứa TẤT CẢ phrases mới được gửi
-    include_closed    → True: tìm cả gói đã đóng thầu (/timtat)
-                        False: chỉ gói còn mở (/tim, mặc định)
-    field_filter      → Lọc lĩnh vực ES phía server, vd. ["HH", "XL"]. None = tất cả.
-    bid_method_filter → 1 = qua mạng, 0 = không qua mạng, None = tất cả.
+    mode="any"  → OR: bid khớp ít nhất 1 phrase.
+    mode="all"  → AND: bid phải chứa TẤT CẢ phrases.
 
-    Chiến lược ES:
-    • OR mode:  query TẤT CẢ phrases lên ES (union), match_bid lọc OR client-side.
-    • AND mode: query TẤT CẢ phrases lên ES (union), match_bid lọc AND client-side.
-      Union + AND client-side đảm bảo gom đủ candidate từ nhiều field khác nhau
-      (vd. "công an" trong investorName, "camera" trong bidName).
-    • Filter-only (phrases rỗng): duyệt tất cả TBMT với bộ lọc server, không lọc từ khóa.
+    Chiến lược tối ưu:
+    • AND mode (≥2 phrases): gộp tất cả phrases thành 1 keyword ES → 1 Playwright session.
+    • OR mode (1 phrase): fetch_recent_bids thường — 1 session.
+    • OR mode (≥2 phrases): fetch_recent_bids_multi (batch) — 1 session thay vì N.
+    • Filter-only (phrases rỗng): duyệt tất cả TBMT với bộ lọc server.
+    • Cache: kết quả được cache 5 phút — tra lại cùng query gần như tức thì.
+    • Relevance sort: matched bids sắp xếp theo số phrase khớp, số match trong title.
 
     Returns (sent_count, total_matching, summary_plain).
     Không đụng vào SQLite.
@@ -103,25 +160,31 @@ def run_interactive_keyword_search(
             filter_parts.append(f"lĩnh vực={field_filter}")
         if bid_method_filter is not None:
             filter_parts.append(f"hình thức={'qua mạng' if bid_method_filter == 1 else 'không qua mạng'}")
-        filter_note = f" | bộ lọc: {', '.join(filter_parts)}" if filter_parts else ""
+
+        max_pages = secrets.interactive_fetch_max_pages
+        open_only = not include_closed
 
         logger.info(
-            "interactive_fetch mode={} ({} pages × {}) per phrase, phrases={}, filters={}",
-            require,
-            secrets.interactive_fetch_max_pages,
-            secrets.crawl_page_size,
-            uniq,
-            filter_parts or "none",
+            "interactive_fetch mode={} phrases={} pages={} filters={}",
+            require, uniq, max_pages, filter_parts or "none",
         )
 
-        open_only = not include_closed
+        # ── Check cache ───────────────────────────────────────────────────────
+        cache_key = _make_cache_key(uniq, require, include_closed, field_filter, bid_method_filter, max_pages)
+        cached_bids = _cache_get(cache_key)
+
         by_code: dict[str, Bid] = {}
 
-        if not uniq:
-            # Filter-only mode — browse all TBMT with server-side filters, no keyword
-            logger.info("interactive_fetch: filter-only mode (no keywords), browsing all TBMT")
+        if cached_bids is not None:
+            logger.info("interactive_fetch: cache hit — {} bids, skip crawling", len(cached_bids))
+            for b in cached_bids:
+                by_code[b.tbmt_code] = b
+            bids = cached_bids
+        elif not uniq:
+            # ── Filter-only mode ──────────────────────────────────────────────
+            logger.info("interactive_fetch: filter-only mode (no keywords)")
             part = crawler.fetch_recent_bids(
-                max_pages=secrets.interactive_fetch_max_pages,
+                max_pages=max_pages,
                 server_keyword=None,
                 open_only=open_only,
                 field_filter=field_filter,
@@ -130,23 +193,64 @@ def run_interactive_keyword_search(
             for b in part:
                 by_code.setdefault(b.tbmt_code, b)
             bids = list(by_code.values())
-            # No client-side keyword filtering needed — all bids are candidates
-            matched = [(bid, []) for bid in bids]
+            _cache_put(cache_key, bids)
+        elif require == "all" and len(uniq) >= 2:
+            # ── AND optimisation: join all phrases → 1 ES keyword → 1 session ─
+            # ES "all-1" tokenises by space, so joining with space is equivalent
+            # to requiring all tokens present in indexed fields.
+            combined_kw = " ".join(uniq)
+            logger.info(
+                "interactive_fetch: AND batch — combined keyword='{}' (1 session instead of {})",
+                combined_kw, len(uniq),
+            )
+            part = crawler.fetch_recent_bids(
+                max_pages=max_pages,
+                server_keyword=combined_kw,
+                open_only=open_only,
+                field_filter=field_filter,
+                bid_method_filter=bid_method_filter,
+            )
+            for b in part:
+                by_code.setdefault(b.tbmt_code, b)
+            bids = list(by_code.values())
+            _cache_put(cache_key, bids)
+        elif len(uniq) == 1:
+            # ── Single phrase (OR or AND with 1 term) ─────────────────────────
+            part = crawler.fetch_recent_bids(
+                max_pages=max_pages,
+                server_keyword=uniq[0],
+                open_only=open_only,
+                field_filter=field_filter,
+                bid_method_filter=bid_method_filter,
+            )
+            for b in part:
+                by_code.setdefault(b.tbmt_code, b)
+            bids = list(by_code.values())
+            _cache_put(cache_key, bids)
         else:
-            # Keyword mode — Query từng phrase lên ES, lấy UNION để có đủ candidates
-            # Client-side match_bid() sẽ áp dụng AND/OR logic chính xác sau đó
-            for phrase in uniq:
-                part = crawler.fetch_recent_bids(
-                    max_pages=secrets.interactive_fetch_max_pages,
-                    server_keyword=phrase,
-                    open_only=open_only,
-                    field_filter=field_filter,
-                    bid_method_filter=bid_method_filter,
-                )
-                for b in part:
+            # ── OR mode multi-phrase: batch (1 Playwright session) ────────────
+            logger.info(
+                "interactive_fetch: OR batch — {} phrases → 1 Playwright session",
+                len(uniq),
+            )
+            phrase_map = crawler.fetch_recent_bids_multi(
+                phrases=uniq,
+                max_pages=max_pages,
+                open_only=open_only,
+                field_filter=field_filter,
+                bid_method_filter=bid_method_filter,
+            )
+            for bids_for_phrase in phrase_map.values():
+                for b in bids_for_phrase:
                     by_code.setdefault(b.tbmt_code, b)
             bids = list(by_code.values())
+            _cache_put(cache_key, bids)
 
+        # ── Client-side keyword filtering ─────────────────────────────────────
+        if not uniq:
+            # Filter-only — all crawled bids qualify
+            matched = [(bid, []) for bid in bids]
+        else:
             cfg = KeywordsConfig(
                 groups=[KeywordGroup(name="Search", require=require, keywords=phrases)]
             )
@@ -159,9 +263,16 @@ def run_interactive_keyword_search(
                 if ok:
                     matched.append((bid, ks))
 
+            # ── Relevance sort (most relevant first) ──────────────────────────
+            if len(matched) > 1 and len(uniq) > 1:
+                matched.sort(
+                    key=lambda t: _relevance_score(t[0], uniq, secrets.interactive_search_strict_keywords),
+                    reverse=True,
+                )
+
         total = len(matched)
         n_from_portal = len(bids)
-        max_slots = secrets.interactive_fetch_max_pages * secrets.crawl_page_size * max(1, len(uniq))
+        max_slots = max_pages * secrets.crawl_page_size * max(1, len(uniq))
         to_emit = matched[:cap]
 
         for i, (bid, ks) in enumerate(to_emit):
@@ -182,6 +293,7 @@ def run_interactive_keyword_search(
 
         closed_note = " (bao gồm gói đã đóng thầu)" if include_closed else ""
         filter_suffix = f"\nBộ lọc: {', '.join(filter_parts)}" if filter_parts else ""
+        cache_note = " ⚡ (từ cache)" if cached_bids is not None else ""
 
         if total == 0:
             no_result_hint = (
@@ -194,7 +306,7 @@ def run_interactive_keyword_search(
                 )
             if filter_parts:
                 no_result_hint += "Thử bỏ bớt bộ lọc để mở rộng kết quả. "
-            no_result_hint += "Có thể tăng CRAWL_MAX_PAGES hoặc INTERACTIVE_CRAWL_MAX_PAGES trong .env."
+            no_result_hint += "Có thể tăng INTERACTIVE_CRAWL_MAX_PAGES trong .env."
             if is_filter_only:
                 summary = (
                     f"Không thấy gói TBMT nào{closed_note} với bộ lọc đã chọn."
@@ -213,33 +325,31 @@ def run_interactive_keyword_search(
         elif total > sent:
             if is_filter_only:
                 summary = (
-                    f"Tìm thấy {total} gói{closed_note}. Đã gửi {sent} tin (giới hạn {cap}/lần)."
+                    f"Tìm thấy {total} gói{closed_note}{cache_note}. Đã gửi {sent} tin (giới hạn {cap}/lần)."
                     + filter_suffix
                 )
             else:
                 summary = (
-                    f"Tìm thấy {total} gói [{mode_display}]{closed_note}. Đã gửi {sent} tin (giới hạn {cap}/lần).\n"
+                    f"Tìm thấy {total} gói [{mode_display}]{closed_note}{cache_note}. Đã gửi {sent} tin (giới hạn {cap}/lần).\n"
                     "Thu hẹp từ khóa hoặc xem chi tiết trên muasamcong để tiếp tục lọc."
                     + filter_suffix
                 )
             if n_from_portal > total and not is_filter_only:
-                summary += f" (Đã cào tối đa ~{max_slots} ô kết quả; API trả {n_from_portal} gói khác nhau.)"
+                summary += f" (Đã cào ~{max_slots} ô; API trả {n_from_portal} gói, lọc còn {total}.)"
         else:
             if is_filter_only:
-                summary = f"Tìm thấy {total} gói{closed_note}. Đã gửi {sent} tin." + filter_suffix
+                summary = f"Tìm thấy {total} gói{closed_note}{cache_note}. Đã gửi {sent} tin." + filter_suffix
             else:
-                summary = f"Tìm thấy {total} gói [{mode_display}]{closed_note}. Đã gửi {sent} tin." + filter_suffix
+                summary = f"Tìm thấy {total} gói [{mode_display}]{closed_note}{cache_note}. Đã gửi {sent} tin." + filter_suffix
                 if total == 1 and n_from_portal > 1:
                     summary += (
-                        f"\nLưu ý: bot đã gom tối đa {secrets.interactive_fetch_max_pages} trang ES × "
-                        f"{secrets.crawl_page_size} gói cho mỗi cụm từ (~{max_slots} ô); "
-                        f"API trả {n_from_portal} gói khác nhau, chỉ 1 gói đáp ứng đủ điều kiện lọc."
+                        f"\nLưu ý: đã cào ~{max_slots} ô; API trả {n_from_portal} gói, "
+                        f"chỉ 1 gói đáp ứng đủ điều kiện lọc."
                     )
                 elif total == 1 and n_from_portal == 1:
-                    scope_desc = scope_label
                     summary += (
-                        f" Trong phạm vi đã cào ({secrets.interactive_fetch_max_pages} trang ES/cụm), "
-                        f"cổng chỉ trả đúng 1 gói TBMT ({scope_desc}) khớp tìm kiếm."
+                        f" Trong phạm vi đã cào ({max_pages} trang ES), "
+                        f"cổng chỉ trả đúng 1 gói TBMT ({scope_label}) khớp tìm kiếm."
                     )
 
         return sent, total, summary
@@ -247,4 +357,11 @@ def run_interactive_keyword_search(
         crawler.close()
 
 
-__all__ = ["parse_keyword_phrases", "parse_search_query", "run_interactive_keyword_search"]
+__all__ = [
+    "parse_keyword_phrases",
+    "parse_search_query",
+    "run_interactive_keyword_search",
+    "_make_cache_key",
+    "_cache_get",
+    "_cache_put",
+]

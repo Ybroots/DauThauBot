@@ -417,6 +417,230 @@ class MuasamcongCrawler:
             raise BlockedException(429)
         return data
 
+    # ── Playwright helper methods (shared by _search_playwright + _search_playwright_batch) ──
+
+    @staticmethod
+    def _pw_ctx_destroyed(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "execution context was destroyed" in msg or "context was destroyed" in msg
+
+    def _pw_stabilize(self, page: Any, nav_try: int) -> None:
+        """Chờ reCAPTCHA + mạng nguôi — không gọi evaluate dài (dễ vỡ khi SPA redirect)."""
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+        except ImportError:
+            PlaywrightError = Exception  # type: ignore[misc,assignment]
+        logger.info("Playwright: chờ script reCAPTCHA tải (tối đa 90s, log mỗi ~10s)…")
+        g_deadline = time.time() + 90.0
+        g_start = time.time()
+        g_last_log = g_start
+        while time.time() < g_deadline:
+            if page.evaluate("() => typeof grecaptcha !== 'undefined'"):
+                logger.info(
+                    "Playwright: reCAPTCHA đã có trên trang sau {:.0f}s",
+                    time.time() - g_start,
+                )
+                break
+            now = time.time()
+            if now - g_last_log >= 10.0:
+                logger.info("Playwright: vẫn chờ grecaptcha… {:.0f}s", now - g_start)
+                g_last_log = now
+            time.sleep(1.0)
+        else:
+            raise RuntimeError("reCAPTCHA: không thấy grecaptcha sau 90s")
+
+        nw_ms = 22000 if nav_try == 0 else 18000
+        logger.info("Playwright: chờ mạng nguôi (tối đa {}s, có thể bỏ qua sớm)…", nw_ms // 1000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=nw_ms)
+            logger.info("Playwright: mạng đã nguôi")
+        except PlaywrightError:
+            logger.info("Playwright: hết thời gian chờ networkidle — tiếp tục (SPA vẫn chạy ngầm)")
+        time.sleep(2.8 if nav_try == 0 else 2.0)
+
+    @staticmethod
+    def _pw_extract_site_key(page: Any) -> Optional[str]:
+        """Khớp ?render= trên <script src="...recaptcha/api.js?render=..."> — tránh Invalid site key."""
+        return page.evaluate(
+            """() => {
+                const scripts = Array.from(
+                    document.querySelectorAll('script[src*="recaptcha/api.js"]')
+                );
+                for (const sc of scripts) {
+                    try {
+                        const src = sc.getAttribute("src") || "";
+                        const u = new URL(src, window.location.origin);
+                        const r = u.searchParams.get("render");
+                        if (r) return r.trim();
+                    } catch (e) {}
+                }
+                return null;
+            }"""
+        )
+
+    @staticmethod
+    def _pw_get_token(page: Any, site_key: str) -> str:
+        """Đăng ký token: async IIFE + Promise.race timeout — tránh treo vô hạn."""
+        logger.info("Playwright: đăng ký lấy token reCAPTCHA v3…")
+        page.evaluate(
+            """(siteKey) => {
+                window.__egpTkDone = false;
+                window.__egpTk = null;
+                window.__egpTkErr = null;
+                const fail = (msg) => {
+                    window.__egpTkErr = msg;
+                    window.__egpTkDone = true;
+                };
+                if (typeof grecaptcha === 'undefined' || typeof grecaptcha.execute !== 'function') {
+                    fail('grecaptcha_execute_missing');
+                    return;
+                }
+                (async () => {
+                    try {
+                        // ready() đôi khi không gọi callback (hai script recaptcha / SPA) → timeout rồi vẫn thử execute
+                        try {
+                            await Promise.race([
+                                new Promise((resolve, reject) => {
+                                    try {
+                                        if (typeof grecaptcha.ready === 'function') {
+                                            grecaptcha.ready(() => resolve());
+                                        } else {
+                                            resolve();
+                                        }
+                                    } catch (e) {
+                                        reject(e);
+                                    }
+                                }),
+                                new Promise((_, rej) =>
+                                    setTimeout(
+                                        () => rej(new Error('grecaptcha_ready_timeout_12s')),
+                                        12000
+                                    )
+                                ),
+                            ]);
+                        } catch (_) {
+                            /* bỏ qua — chạy execute trực tiếp */
+                        }
+                        const t = await Promise.race([
+                            grecaptcha.execute(siteKey, { action: 'submit' }),
+                            new Promise((_, rej) =>
+                                setTimeout(
+                                    () => rej(new Error('recaptcha_execute_timeout_45s')),
+                                    45000
+                                )
+                            ),
+                        ]);
+                        if (!t || typeof t !== 'string') {
+                            fail('empty_token_from_google');
+                            return;
+                        }
+                        window.__egpTk = t;
+                        window.__egpTkDone = true;
+                    } catch (e) {
+                        fail(String((e && e.message) || e));
+                    }
+                })();
+            }""",
+            site_key,
+        )
+        deadline = time.time() + 62.0
+        poll_s = 1.5
+        start = time.time()
+        last_log = start
+        while time.time() < deadline:
+            done = page.evaluate("() => window.__egpTkDone === true")
+            if done:
+                logger.info("Playwright: reCAPTCHA xong sau {:.0f}s", time.time() - start)
+                break
+            now = time.time()
+            if now - last_log >= 10.0:
+                logger.info(
+                    "Playwright: vẫn đang chờ token reCAPTCHA… {:.0f}s — (thường 3–20s; nếu >50s kiểm tra mạng tới google.com)",
+                    now - start,
+                )
+                last_log = now
+            time.sleep(poll_s)
+        else:
+            raise RuntimeError(
+                "reCAPTCHA: hết thời gian ~62s (token không về). "
+                "Thử PLAYWRIGHT_HEADLESS=false hoặc PLAYWRIGHT_CHANNEL=chrome trong .env; "
+                "kiểm tra firewall/VPN chặn www.google.com."
+            )
+
+        err = page.evaluate("() => window.__egpTkErr")
+        token = page.evaluate("() => window.__egpTk")
+        if err:
+            raise RuntimeError(f"reCAPTCHA: {err}")
+        if not token or not isinstance(token, str):
+            raise RuntimeError("empty reCAPTCHA token")
+        return token
+
+    def _pw_launch_browser(self, p: Any) -> Any:
+        """Launch Chromium với các flag chống detect automation."""
+        launch_kw: dict[str, Any] = {
+            "headless": self.playwright_headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        }
+        if self.playwright_channel:
+            launch_kw["channel"] = self.playwright_channel
+        browser = p.chromium.launch(**launch_kw)
+        logger.info(
+            "Playwright: Chromium headless={} channel={}",
+            self.playwright_headless,
+            self.playwright_channel or "bundled",
+        )
+        return browser
+
+    def _pw_new_page(self, browser: Any) -> Any:
+        context = browser.new_context(
+            user_agent=self.user_agent,
+            locale="vi-VN",
+            viewport={"width": 1365, "height": 900},
+        )
+        page = context.new_page()
+
+        def _pw_console(msg: Any) -> None:
+            try:
+                if msg.type in ("error", "warning"):
+                    logger.info("Playwright console[{}]: {}", msg.type, msg.text[:800])
+            except Exception:
+                pass
+
+        page.on("console", _pw_console)
+        return context, page
+
+    def _pw_navigate_and_prepare(self, context: Any, page: Any, nav_try: int) -> tuple[Any, str]:
+        """Navigate to index, stabilize, extract site key. Returns (page, site_key)."""
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+        except ImportError:
+            PlaywrightError = Exception  # type: ignore[misc,assignment]
+
+        if nav_try > 0:
+            try:
+                page.close()
+            except PlaywrightError:
+                pass
+            _, page = self._pw_new_page(context)
+
+        page.goto(INDEX_URL, wait_until="load", timeout=120000)
+        logger.info("Playwright: đã tải xong trang index cổng")
+        self._pw_stabilize(page, nav_try)
+
+        render_key = self._pw_extract_site_key(page)
+        site_key = (render_key or "").strip() or RECAPTCHA_SITE_KEY
+        if render_key:
+            logger.info("Playwright: site key lấy từ trang (render=) — {}…", site_key[:14])
+        else:
+            logger.warning("Playwright: không đọc được render= trên DOM — dùng RECAPTCHA_SITE_KEY trong code")
+        return page, site_key
+
+    # ── Single-payload search (used by _search → cron path) ──────────────────
+
     def _search_playwright(self, payload: list[dict[str, Any]]) -> dict[str, Any]:
         try:
             from playwright.sync_api import Error as PlaywrightError
@@ -430,229 +654,22 @@ class MuasamcongCrawler:
             payload[0].get("pageNumber"),
         )
 
-        def _ctx_destroyed(exc: BaseException) -> bool:
-            msg = str(exc).lower()
-            return "execution context was destroyed" in msg or "context was destroyed" in msg
-
-        def _stabilize_after_goto(page, nav_try: int) -> None:
-            """Chờ reCAPTCHA + mạng nguôi — không gọi evaluate dài (dễ vỡ khi SPA redirect)."""
-            logger.info("Playwright: chờ script reCAPTCHA tải (tối đa 90s, log mỗi ~10s)…")
-            g_deadline = time.time() + 90.0
-            g_start = time.time()
-            g_last_log = g_start
-            while time.time() < g_deadline:
-                if page.evaluate("() => typeof grecaptcha !== 'undefined'"):
-                    logger.info(
-                        "Playwright: reCAPTCHA đã có trên trang sau {:.0f}s",
-                        time.time() - g_start,
-                    )
-                    break
-                now = time.time()
-                if now - g_last_log >= 10.0:
-                    logger.info("Playwright: vẫn chờ grecaptcha… {:.0f}s", now - g_start)
-                    g_last_log = now
-                time.sleep(1.0)
-            else:
-                raise RuntimeError("reCAPTCHA: không thấy grecaptcha sau 90s")
-
-            nw_ms = 22000 if nav_try == 0 else 18000
-            logger.info("Playwright: chờ mạng nguôi (tối đa {}s, có thể bỏ qua sớm)…", nw_ms // 1000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=nw_ms)
-                logger.info("Playwright: mạng đã nguôi")
-            except PlaywrightError:
-                logger.info("Playwright: hết thời gian chờ networkidle — tiếp tục (SPA vẫn chạy ngầm)")
-            time.sleep(2.8 if nav_try == 0 else 2.0)
-
-        def _extract_recaptcha_site_key_from_dom(page) -> Optional[str]:
-            """Khớp ?render= trên <script src=\"...recaptcha/api.js?render=...\"> — tránh Invalid site key."""
-            return page.evaluate(
-                """() => {
-                    const scripts = Array.from(
-                        document.querySelectorAll('script[src*="recaptcha/api.js"]')
-                    );
-                    for (const sc of scripts) {
-                        try {
-                            const src = sc.getAttribute("src") || "";
-                            const u = new URL(src, window.location.origin);
-                            const r = u.searchParams.get("render");
-                            if (r) return r.trim();
-                        } catch (e) {}
-                    }
-                    return null;
-                }"""
-            )
-
-        def _recaptcha_token_via_polling(page, site_key: str) -> str:
-            """Đăng ký token: async IIFE (evaluate trả về ngay) + Promise.race timeout — tránh treo vô hạn."""
-            logger.info("Playwright: đăng ký lấy token reCAPTCHA v3…")
-            page.evaluate(
-                """(siteKey) => {
-                    window.__egpTkDone = false;
-                    window.__egpTk = null;
-                    window.__egpTkErr = null;
-                    const fail = (msg) => {
-                        window.__egpTkErr = msg;
-                        window.__egpTkDone = true;
-                    };
-                    if (typeof grecaptcha === 'undefined' || typeof grecaptcha.execute !== 'function') {
-                        fail('grecaptcha_execute_missing');
-                        return;
-                    }
-                    (async () => {
-                        try {
-                            // ready() đôi khi không gọi callback (hai script recaptcha / SPA) → timeout rồi vẫn thử execute
-                            try {
-                                await Promise.race([
-                                    new Promise((resolve, reject) => {
-                                        try {
-                                            if (typeof grecaptcha.ready === 'function') {
-                                                grecaptcha.ready(() => resolve());
-                                            } else {
-                                                resolve();
-                                            }
-                                        } catch (e) {
-                                            reject(e);
-                                        }
-                                    }),
-                                    new Promise((_, rej) =>
-                                        setTimeout(
-                                            () => rej(new Error('grecaptcha_ready_timeout_12s')),
-                                            12000
-                                        )
-                                    ),
-                                ]);
-                            } catch (_) {
-                                /* bỏ qua — chạy execute trực tiếp */
-                            }
-                            const t = await Promise.race([
-                                grecaptcha.execute(siteKey, { action: 'submit' }),
-                                new Promise((_, rej) =>
-                                    setTimeout(
-                                        () => rej(new Error('recaptcha_execute_timeout_45s')),
-                                        45000
-                                    )
-                                ),
-                            ]);
-                            if (!t || typeof t !== 'string') {
-                                fail('empty_token_from_google');
-                                return;
-                            }
-                            window.__egpTk = t;
-                            window.__egpTkDone = true;
-                        } catch (e) {
-                            fail(String((e && e.message) || e));
-                        }
-                    })();
-                }""",
-                site_key,
-            )
-            deadline = time.time() + 62.0
-            poll_s = 1.5
-            start = time.time()
-            last_log = start
-            while time.time() < deadline:
-                done = page.evaluate("() => window.__egpTkDone === true")
-                if done:
-                    logger.info("Playwright: reCAPTCHA xong sau {:.0f}s", time.time() - start)
-                    break
-                now = time.time()
-                if now - last_log >= 10.0:
-                    logger.info(
-                        "Playwright: vẫn đang chờ token reCAPTCHA… {:.0f}s — (thường 3–20s; nếu >50s kiểm tra mạng tới google.com)",
-                        now - start,
-                    )
-                    last_log = now
-                time.sleep(poll_s)
-            else:
-                raise RuntimeError(
-                    "reCAPTCHA: hết thời gian ~62s (token không về). "
-                    "Thử PLAYWRIGHT_HEADLESS=false hoặc PLAYWRIGHT_CHANNEL=chrome trong .env; "
-                    "kiểm tra firewall/VPN chặn www.google.com."
-                )
-
-            err = page.evaluate("() => window.__egpTkErr")
-            token = page.evaluate("() => window.__egpTk")
-            if err:
-                raise RuntimeError(f"reCAPTCHA: {err}")
-            if not token or not isinstance(token, str):
-                raise RuntimeError("empty reCAPTCHA token")
-            return token
-
         last_err: Optional[BaseException] = None
         for session_try in range(3):
             logger.info("Playwright: mở phiên trình duyệt {}/3…", session_try + 1)
             with sync_playwright() as p:
-                launch_kw: dict[str, Any] = {
-                    "headless": self.playwright_headless,
-                    "args": [
-                        "--disable-blink-features=AutomationControlled",
-                        "--disable-dev-shm-usage",
-                        "--no-sandbox",
-                    ],
-                }
-                if self.playwright_channel:
-                    launch_kw["channel"] = self.playwright_channel
-                browser = p.chromium.launch(**launch_kw)
-                logger.info(
-                    "Playwright: Chromium headless={} channel={}",
-                    self.playwright_headless,
-                    self.playwright_channel or "bundled",
-                )
+                browser = self._pw_launch_browser(p)
                 try:
-                    context = browser.new_context(
-                        user_agent=self.user_agent,
-                        locale="vi-VN",
-                        viewport={"width": 1365, "height": 900},
-                    )
-                    page = context.new_page()
-
-                    def _pw_console(msg) -> None:
-                        try:
-                            if msg.type in ("error", "warning"):
-                                logger.info("Playwright console[{}]: {}", msg.type, msg.text[:800])
-                        except Exception:
-                            pass
-
-                    page.on("console", _pw_console)
+                    context, page = self._pw_new_page(browser)
                     exhausted_context = False
                     for nav_try in range(3):
                         try:
-                            if nav_try > 0:
-                                try:
-                                    page.close()
-                                except PlaywrightError:
-                                    pass
-                                page = context.new_page()
-
-                            page.goto(
-                                INDEX_URL,
-                                wait_until="load",
-                                timeout=120000,
-                            )
-                            logger.info("Playwright: đã tải xong trang index cổng")
-                            _stabilize_after_goto(page, nav_try)
-
-                            render_key = _extract_recaptcha_site_key_from_dom(page)
-                            site_key = (render_key or "").strip() or RECAPTCHA_SITE_KEY
-                            if render_key:
-                                logger.info(
-                                    "Playwright: site key lấy từ trang (render=) — {}…",
-                                    site_key[:14],
-                                )
-                            else:
-                                logger.warning(
-                                    "Playwright: không đọc được render= trên DOM — dùng RECAPTCHA_SITE_KEY trong code",
-                                )
-
-                            token = _recaptcha_token_via_polling(page, site_key)
+                            page, site_key = self._pw_navigate_and_prepare(context, page, nav_try)
+                            token = self._pw_get_token(page, site_key)
 
                             logger.info("Playwright: đang POST smart/search…")
                             url = f"{BASE_URL}{SEARCH_ENDPOINT}?token={token}"
-                            headers = {
-                                **self._api_headers(),
-                                "Content-Type": "application/json",
-                            }
+                            headers = {**self._api_headers(), "Content-Type": "application/json"}
                             resp = context.request.post(
                                 url,
                                 headers=headers,
@@ -681,12 +698,10 @@ class MuasamcongCrawler:
                             return data
                         except PlaywrightError as e:
                             last_err = e
-                            if _ctx_destroyed(e):
+                            if self._pw_ctx_destroyed(e):
                                 logger.warning(
                                     "Playwright context lost (session {} nav {}): {}",
-                                    session_try,
-                                    nav_try,
-                                    e,
+                                    session_try, nav_try, e,
                                 )
                                 if nav_try < 2:
                                     time.sleep(1.5 * (nav_try + 1))
@@ -707,6 +722,207 @@ class MuasamcongCrawler:
                     browser.close()
 
         raise RuntimeError("Playwright search exhausted sessions without returning data")
+
+    # ── Batch-payload search (interactive: N phrases × M pages = 1 session) ──
+
+    def _search_playwright_batch(
+        self, payloads: list[list[dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Gửi nhiều payloads trong MỘT Playwright session — ONE reCAPTCHA acquisition.
+
+        Returns list of response dicts (same order as payloads).
+        4 payloads trước → 4 browser sessions (2-6 phút).
+        Với batch → 1 session, token dùng lại ~120s giữa các POST.
+        """
+        if not payloads:
+            return []
+        if not self.use_playwright:
+            return [self._search_httpx(p, token=None) for p in payloads]
+
+        try:
+            from playwright.sync_api import Error as PlaywrightError
+            from playwright.sync_api import sync_playwright
+        except ImportError as e:
+            logger.warning("Playwright not installed, falling back to httpx: {}", e)
+            return [self._search_httpx(p, token=None) for p in payloads]
+
+        logger.info(
+            "Playwright batch: {} payloads → 1 phiên trình duyệt (thay vì {} phiên)",
+            len(payloads),
+            len(payloads),
+        )
+
+        last_err: Optional[BaseException] = None
+        for session_try in range(3):
+            logger.info("Playwright batch: mở phiên {}/3…", session_try + 1)
+            with sync_playwright() as p:
+                browser = self._pw_launch_browser(p)
+                try:
+                    context, page = self._pw_new_page(browser)
+                    exhausted_context = False
+                    for nav_try in range(3):
+                        try:
+                            page, site_key = self._pw_navigate_and_prepare(context, page, nav_try)
+                            # Acquire token once; reuse for all payloads (valid ~120s)
+                            token = self._pw_get_token(page, site_key)
+                            token_acquired_at = time.time()
+
+                            results: list[dict[str, Any]] = []
+                            for idx, payload in enumerate(payloads):
+                                # Refresh token if > 100s have elapsed (safety margin)
+                                if idx > 0 and time.time() - token_acquired_at > 100:
+                                    logger.info(
+                                        "Playwright batch: token cũ ({:.0f}s) — lấy token mới cho payload {}/{}…",
+                                        time.time() - token_acquired_at,
+                                        idx + 1,
+                                        len(payloads),
+                                    )
+                                    token = self._pw_get_token(page, site_key)
+                                    token_acquired_at = time.time()
+
+                                logger.info(
+                                    "Playwright batch: POST payload {}/{} (page={})…",
+                                    idx + 1,
+                                    len(payloads),
+                                    payload[0].get("pageNumber"),
+                                )
+                                url = f"{BASE_URL}{SEARCH_ENDPOINT}?token={token}"
+                                headers = {**self._api_headers(), "Content-Type": "application/json"}
+                                resp = context.request.post(
+                                    url,
+                                    headers=headers,
+                                    data=json.dumps(payload),
+                                    timeout=120000,
+                                )
+                                if resp.status in (429, 403):
+                                    raise BlockedException(resp.status)
+                                if not resp.ok:
+                                    body = resp.text()
+                                    raise httpx.HTTPStatusError(
+                                        f"Search failed: {body[:500]}",
+                                        request=httpx.Request("POST", SEARCH_ENDPOINT),
+                                        response=httpx.Response(resp.status),
+                                    )
+                                data = resp.json()
+                                if isinstance(data, (int, float)):
+                                    raise BlockedException(429)
+                                n = 0
+                                if isinstance(data, dict):
+                                    page_obj = data.get("page") or {}
+                                    content = page_obj.get("content")
+                                    if isinstance(content, list):
+                                        n = len(content)
+                                logger.info(
+                                    "Playwright batch: payload {}/{} xong — {} dòng",
+                                    idx + 1, len(payloads), n,
+                                )
+                                results.append(data)
+                                if idx < len(payloads) - 1:
+                                    time.sleep(1.2)  # brief inter-request pause
+                            return results
+
+                        except PlaywrightError as e:
+                            last_err = e
+                            if self._pw_ctx_destroyed(e):
+                                logger.warning(
+                                    "Playwright batch: context lost (session {} nav {}): {}",
+                                    session_try, nav_try, e,
+                                )
+                                if nav_try < 2:
+                                    time.sleep(1.5 * (nav_try + 1))
+                                    continue
+                                exhausted_context = True
+                                break
+                            raise
+                    if exhausted_context and session_try < 2:
+                        logger.warning(
+                            "Playwright batch: new session after context loss ({}/2)",
+                            session_try + 1,
+                        )
+                        time.sleep(2.0 * (session_try + 1))
+                        continue
+                    if exhausted_context and last_err is not None:
+                        raise last_err
+                finally:
+                    browser.close()
+
+        raise RuntimeError("Playwright batch: exhausted sessions without returning data")
+
+    def fetch_recent_bids_multi(
+        self,
+        phrases: list[str],
+        max_pages: int = 2,
+        *,
+        max_pages_cap: int = 10,
+        open_only: bool = True,
+        field_filter: Optional[list[str]] = None,
+        bid_method_filter: Optional[int] = None,
+    ) -> dict[str, list]:
+        """Cào nhiều phrase trong 1 Playwright session (batch) — thay vì N session riêng lẻ.
+
+        Returns dict: phrase → list[Bid].
+        OR mode: 2 phrases × 2 pages = 4 payloads → 1 browser session (tiết kiệm 3 session).
+        """
+        from .models import Bid
+
+        if not phrases:
+            return {}
+
+        max_pages = max(1, min(max_pages, max_pages_cap))
+        self._warmup_session()
+        self._load_field_names()
+
+        # Build all payloads upfront: phrases × pages in interleaved order
+        # (interleave by page number so early pages of all phrases come first)
+        all_payloads: list[list[dict[str, Any]]] = []
+        payload_keys: list[str] = []  # phrase for each payload slot
+
+        for pg in range(max_pages):
+            for phrase in phrases:
+                sk = phrase.strip()
+                if sk:
+                    pl = build_tbmt_keyword_payload(
+                        page_number=pg,
+                        page_size=self.page_size,
+                        keyword=sk,
+                        open_only=open_only,
+                        field_filter=field_filter,
+                        bid_method_filter=bid_method_filter,
+                    )
+                else:
+                    pl = build_tbmt_payload(
+                        page_number=pg,
+                        page_size=self.page_size,
+                        open_only=open_only,
+                        field_filter=field_filter,
+                        bid_method_filter=bid_method_filter,
+                    )
+                all_payloads.append(pl)
+                payload_keys.append(sk)
+
+        logger.info(
+            "fetch_recent_bids_multi: {} phrases × {} pages = {} payloads → 1 Playwright session",
+            len(phrases),
+            max_pages,
+            len(all_payloads),
+        )
+
+        if self.use_playwright:
+            raw_results = self._search_playwright_batch(all_payloads)
+        else:
+            raw_results = [self._search_httpx(pl, token=None) for pl in all_payloads]
+
+        # Aggregate results per phrase
+        result: dict[str, list] = {phrase.strip(): [] for phrase in phrases}
+        for phrase_key, data in zip(payload_keys, raw_results):
+            bids = parse_search_response(data, self._field_names)
+            if phrase_key in result:
+                result[phrase_key].extend(bids)
+
+        for phrase, bids in result.items():
+            logger.info("fetch_recent_bids_multi: '{}' → {} bids", phrase, len(bids))
+
+        return result
 
     def close(self) -> None:
         self.client.close()
