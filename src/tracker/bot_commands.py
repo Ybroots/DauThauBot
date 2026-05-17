@@ -57,6 +57,19 @@ _last_search_ts: dict[str, float] = {}
 # { state_key: { "accumulated": [str], "bids": [Bid], "suggestions": [(str,int)] } }
 _suggest_state: dict[str, dict] = {}
 
+# State cho luồng /loc — bộ lọc tìm kiếm nâng cao
+# { state_key: { "fields": list[str], "method": int|None, "closed": bool } }
+_filter_state: dict[str, dict] = {}
+
+# Lĩnh vực đấu thầu — mã ES và tên hiển thị
+FIELD_OPTIONS: list[tuple[str, str]] = [
+    ("HH", "Hàng hóa"),
+    ("XL", "Xây lắp"),
+    ("TV", "Tư vấn"),
+    ("PTV", "Phi tư vấn"),
+    ("HON_HOP", "Hỗn hợp"),
+]
+
 
 def _state_key(chat_id: str | int, user_id: int) -> str:
     return f"{chat_id}:{user_id}"
@@ -162,8 +175,9 @@ def _kb(rows: list[list[dict]]) -> dict:
 def _main_menu_kb() -> dict:
     return _kb([
         [_btn("🔍 Tìm gói mở", "search|open"), _btn("🌐 Tìm kể cả đóng", "search|closed")],
-        [_btn("📋 Keyword Groups", "cmd|/groups"), _btn("📊 Thống kê", "cmd|/thongke")],
-        [_btn("🕐 Gói hôm nay (24h)", "cmd|/timhom"), _btn("📜 Lịch sử gần đây", "cmd|/lichsu")],
+        [_btn("🔧 Bộ lọc nâng cao", "cmd|/loc"), _btn("📋 Groups", "cmd|/groups")],
+        [_btn("📊 Thống kê", "cmd|/thongke"), _btn("🕐 Hôm nay (24h)", "cmd|/timhom")],
+        [_btn("📜 Lịch sử gần đây", "cmd|/lichsu")],
     ])
 
 
@@ -172,7 +186,67 @@ def _after_search_kb(include_closed: bool = False) -> dict:
         row1 = [_btn("🌐 Tìm lại (tất cả)", "search|closed"), _btn("🔍 Chỉ gói mở", "search|open")]
     else:
         row1 = [_btn("🔍 Tìm lại", "search|open"), _btn("🌐 Tìm kể cả đóng", "search|closed")]
-    return _kb([row1, [_btn("📋 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]])
+    return _kb([
+        row1,
+        [_btn("🔧 Bộ lọc", "cmd|/loc"), _btn("📋 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")],
+    ])
+
+
+def _loc_kb(state: dict) -> dict:
+    """Keyboard cho /loc — bộ lọc lĩnh vực + hình thức + phạm vi."""
+    fields: list[str] = state.get("fields") or []
+    method: Optional[int] = state.get("method")   # None=tất cả, 1=qua mạng, 0=không qua mạng
+    closed: bool = state.get("closed", False)
+
+    def _f(code: str, label: str) -> dict:
+        icon = "✅" if code in fields else "☐"
+        return _btn(f"{icon} {label}", f"floc|field|{code}")
+
+    rows: list[list[dict]] = [
+        # Lĩnh vực — hàng 3 + hàng 2
+        [_f("HH", "Hàng hóa"), _f("XL", "Xây lắp"), _f("TV", "Tư vấn")],
+        [_f("PTV", "Phi tư vấn"), _f("HON_HOP", "Hỗn hợp")],
+        # Hình thức đấu thầu
+        [
+            _btn(f"{'✅' if method == 1 else '☐'} Qua mạng", "floc|method|1"),
+            _btn(f"{'✅' if method == 0 else '☐'} Không qua mạng", "floc|method|0"),
+            _btn(f"{'✅' if method is None else '☐'} Tất cả HT", "floc|method|all"),
+        ],
+        # Phạm vi tìm kiếm
+        [
+            _btn(f"{'✅' if not closed else '☐'} Chỉ gói mở", "floc|scope|open"),
+            _btn(f"{'✅' if closed else '☐'} Kể cả đóng", "floc|scope|closed"),
+        ],
+        # Hành động
+        [_btn("🔍 Tìm ngay", "floc|run"), _btn("🔄 Reset bộ lọc", "floc|reset"), _btn("🏠 Menu", "menu")],
+    ]
+    return _kb(rows)
+
+
+def _show_loc_panel(token: str, chat_id: int | str, fstate: dict) -> None:
+    """Gửi bảng lọc với trạng thái hiện tại."""
+    fields = fstate.get("fields") or []
+    method: Optional[int] = fstate.get("method")
+    closed: bool = fstate.get("closed", False)
+
+    fields_str = (
+        ", ".join(next((lbl for c, lbl in FIELD_OPTIONS if c == f), f) for f in fields)
+        or "Tất cả lĩnh vực"
+    )
+    method_map = {None: "Tất cả hình thức", 1: "Qua mạng", 0: "Không qua mạng"}
+    method_str = method_map.get(method, "Tất cả hình thức")
+    scope_str = "Kể cả đã đóng thầu" if closed else "Chỉ gói đang mở"
+
+    _reply(
+        token, chat_id,
+        "🔧 Bộ lọc nâng cao\n\n"
+        f"  Lĩnh vực: {fields_str}\n"
+        f"  Hình thức: {method_str}\n"
+        f"  Phạm vi:   {scope_str}\n\n"
+        "Bấm ✅ để chọn/bỏ chọn, rồi nhấn Tìm ngay.\n"
+        "Có thể để trống từ khóa — bot sẽ duyệt toàn bộ TBMT theo bộ lọc.",
+        reply_markup=_loc_kb(fstate),
+    )
 
 
 def _groups_kb(all_raw: list[tuple]) -> dict:
@@ -226,10 +300,14 @@ def _execute_search(
     *,
     mode: str = "any",
     include_closed: bool = False,
+    field_filter: Optional[list[str]] = None,
+    bid_method_filter: Optional[int] = None,
 ) -> None:
     phrases = [p for p in phrases if p.strip()]
-    if not phrases:
-        _reply(secrets.telegram_bot_token, target_chat_id, "Chưa có từ khóa. Ví dụ: camera, lâm đồng")
+    has_filter = bool(field_filter) or bid_method_filter is not None
+    if not phrases and not has_filter:
+        _reply(secrets.telegram_bot_token, target_chat_id,
+               "Chưa có từ khóa hoặc bộ lọc. Ví dụ: camera, lâm đồng\nHoặc dùng /loc để đặt bộ lọc.")
         return
     cd_ok, secs = _cooldown_ok(secrets, chat_scope_key)
     if not cd_ok:
@@ -240,12 +318,20 @@ def _execute_search(
             reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
         )
         return
-    mode_note = " [AND — tất cả phải khớp]" if mode == "all" else ""
+    mode_note = " [AND — tất cả phải khớp]" if mode == "all" and phrases else ""
     scope_note = " [tất cả — kể cả đã đóng thầu]" if include_closed else ""
+    filter_notes: list[str] = []
+    if field_filter:
+        field_labels = [next((lbl for c, lbl in FIELD_OPTIONS if c == f), f) for f in field_filter]
+        filter_notes.append(f"Lĩnh vực: {', '.join(field_labels)}")
+    if bid_method_filter is not None:
+        filter_notes.append("Qua mạng" if bid_method_filter == 1 else "Không qua mạng")
+    filter_note = f" | {'; '.join(filter_notes)}" if filter_notes else ""
+    kw_note = f'"{", ".join(phrases)}"' if phrases else "duyệt tất cả"
     _reply(
         secrets.telegram_bot_token,
         target_chat_id,
-        f"Đang tra trên Muasamcong{mode_note}{scope_note} (Playwright có thể mất 30–90 giây), vui lòng chờ…",
+        f"Đang tra Muasamcong — {kw_note}{mode_note}{scope_note}{filter_note}\n(Playwright có thể mất 30–90 giây)…",
     )
     try:
         sent, total, summary = run_interactive_keyword_search(
@@ -254,6 +340,8 @@ def _execute_search(
             target_chat_id=target_chat_id,
             mode=mode,
             include_closed=include_closed,
+            field_filter=field_filter,
+            bid_method_filter=bid_method_filter,
         )
         logger.info(
             "interactive_search done chat={} sent={} matched={}",
@@ -320,6 +408,13 @@ def HELP_VI() -> str:
         "• /timtat Công an tỉnh Lâm Đồng — tìm tất cả (mở + đóng)\n"
         "• /timtat camera & lâm đồng     — AND mode, bao gồm đã đóng\n"
         "  Dùng /timtat khi /tim trả về ít kết quả vì thiếu gói mở.\n\n"
+        "Lọc nâng cao (lĩnh vực, hình thức, phạm vi):\n"
+        "• /loc — mở bảng lọc với nút bấm:\n"
+        "    Lĩnh vực: Hàng hóa | Xây lắp | Tư vấn | Phi tư vấn | Hỗn hợp\n"
+        "    Hình thức: Qua mạng | Không qua mạng\n"
+        "    Phạm vi: Chỉ gói mở | Kể cả đóng\n"
+        "    → Chọn xong, bấm Tìm ngay rồi gõ từ khóa.\n"
+        "    → Để trống từ khóa (gửi -) = duyệt tất cả TBMT theo bộ lọc.\n\n"
         "Chat riêng: gõ thẳng từ khóa (không cần /tim). Hỗ trợ & để AND.\n"
         "Trong nhóm: bắt /tim ... hoặc bật BOT_GROUP_FREEWORD=true.\n\n"
         "Lọc kết quả: mặc định từ đơn phải khớp cả từ (tránh khớp nhầm). Tắt: INTERACTIVE_SEARCH_STRICT_KEYWORDS=false.\n\n"
@@ -354,6 +449,7 @@ def COMMAND_LIST_VI() -> str:
         "• /timtat kw — tra kể cả gói đã đóng\n"
         "• /timgroup Tên — tra theo từ khóa của group đã lưu\n"
         "• /goiy kw — gợi ý từ liên quan, hẹp dần → /taogroup\n"
+        "• /loc — bộ lọc nâng cao (lĩnh vực, hình thức, phạm vi)\n"
         "\nQuản lý groups:\n"
         "• /groups — xem tất cả groups (gồm cả tắt)\n"
         "• /addgroup Tên | all|any | kw1, kw2\n"
@@ -722,6 +818,7 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _await_keyword.pop(ukey, None)
         _await_include_closed.pop(ukey, None)
         _suggest_state.pop(ukey, None)
+        _filter_state.pop(ukey, None)
         _reply(bot_token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
         return
 
@@ -884,6 +981,11 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _execute_search(secrets, g_kws, chat_id, cid_s, mode=g_require)
         return
 
+    if cmd == "/loc":
+        fstate = _filter_state.setdefault(ukey, {"fields": [], "method": None, "closed": False})
+        _show_loc_panel(bot_token, chat_id, fstate)
+        return
+
     routed = handle_slash(
         text.strip(),
         secrets,
@@ -993,13 +1095,41 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         # Không phải số → bỏ qua suggest state, xử lý bình thường bên dưới
 
     if _await_keyword.get(ukey):
-        phrases, search_mode = parse_search_query(text.strip())
-        if not phrases:
-            _reply(bot_token, chat_id, "Chưa có từ khóa. Ví dụ: camera  hoặc  camera & lâm đồng (AND). /hủy để thoát.")
-            return
+        raw_text = text.strip()
+        fstate = _filter_state.pop(ukey, {})
         inc_closed = _await_include_closed.pop(ukey, False)
+        # Override inc_closed from filter state if it was set via /loc
+        if fstate:
+            inc_closed = fstate.get("closed", inc_closed)
+        field_f: Optional[list[str]] = fstate.get("fields") or None
+        method_f: Optional[int] = fstate.get("method")  # None=all, 0 or 1
+
+        # "-" gửi một dấu gạch ngang → tìm không cần từ khóa (chỉ bộ lọc)
+        if raw_text == "-" and fstate:
+            _await_keyword.pop(ukey, None)
+            _execute_search(
+                secrets, [], chat_id, cid_s,
+                mode="any",
+                include_closed=inc_closed,
+                field_filter=field_f,
+                bid_method_filter=method_f,
+            )
+            return
+
+        phrases, search_mode = parse_search_query(raw_text)
+        if not phrases and not fstate:
+            _reply(bot_token, chat_id,
+                   "Chưa có từ khóa. Ví dụ: camera  hoặc  camera & lâm đồng (AND).\n"
+                   "Gửi - (dấu gạch ngang) để tìm chỉ theo bộ lọc đã chọn. /hủy để thoát.")
+            return
         _await_keyword.pop(ukey, None)
-        _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode, include_closed=inc_closed)
+        _execute_search(
+            secrets, phrases, chat_id, cid_s,
+            mode=search_mode,
+            include_closed=inc_closed,
+            field_filter=field_f,
+            bid_method_filter=method_f,
+        )
         return
 
     stripped = text.strip()
@@ -1048,6 +1178,12 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
     # ── menu ─────────────────────────────────────────────────────────────
     if data == "menu":
         _reply(token, chat_id, "Menu chính:", reply_markup=_main_menu_kb())
+        return
+
+    # ── cmd|/loc — mở bảng lọc nâng cao (stateful — không qua handle_slash) ──
+    if data == "cmd|/loc":
+        fstate = _filter_state.setdefault(ukey, {"fields": [], "method": None, "closed": False})
+        _show_loc_panel(token, chat_id, fstate)
         return
 
     # ── cmd|/lệnh — chạy lệnh và trả kết quả kèm keyboard ───────────────
@@ -1181,6 +1317,7 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
         _await_keyword.pop(ukey, None)
         _await_include_closed.pop(ukey, None)
         _suggest_state.pop(ukey, None)
+        _filter_state.pop(ukey, None)
         _reply(token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
         return
 
@@ -1196,6 +1333,78 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
             "Hoặc dùng /goiy để gợi ý từ khóa từ dữ liệu thực.",
             reply_markup=_kb([[_btn("🔙 Groups", "cmd|/groups"), _btn("🏠 Menu", "menu")]]),
         )
+        return
+
+    # ── floc|* — cập nhật bộ lọc /loc ────────────────────────────────────
+    if data.startswith("floc|"):
+        parts = data.split("|")
+        action = parts[1] if len(parts) > 1 else ""
+        value = parts[2] if len(parts) > 2 else ""
+
+        fstate = _filter_state.setdefault(ukey, {"fields": [], "method": None, "closed": False})
+
+        if action == "field":
+            cur_fields: list[str] = fstate.setdefault("fields", [])
+            if value in cur_fields:
+                cur_fields.remove(value)  # toggle off
+            else:
+                cur_fields.append(value)  # toggle on
+
+        elif action == "method":
+            if value == "all":
+                fstate["method"] = None
+            else:
+                try:
+                    fstate["method"] = int(value)
+                except ValueError:
+                    fstate["method"] = None
+
+        elif action == "scope":
+            fstate["closed"] = value == "closed"
+
+        elif action == "reset":
+            fstate.clear()
+            fstate.update({"fields": [], "method": None, "closed": False})
+
+        elif action == "run":
+            # Đặt trạng thái chờ từ khóa — filter đã lưu trong _filter_state
+            _await_keyword[ukey] = True
+            _await_include_closed[ukey] = fstate.get("closed", False)
+
+            # Tóm tắt bộ lọc đã chọn
+            cur_fields = fstate.get("fields") or []
+            cur_method: Optional[int] = fstate.get("method")
+            cur_closed: bool = fstate.get("closed", False)
+            f_str = (
+                ", ".join(next((lbl for c, lbl in FIELD_OPTIONS if c == f), f) for f in cur_fields)
+                or "Tất cả lĩnh vực"
+            )
+            m_str = {None: "Tất cả hình thức", 1: "Qua mạng", 0: "Không qua mạng"}.get(cur_method, "Tất cả")
+            s_str = "Kể cả đã đóng" if cur_closed else "Chỉ gói mở"
+
+            has_filter = bool(cur_fields) or cur_method is not None
+            extra = ""
+            if has_filter or cur_closed:
+                extra = (
+                    f"\nBộ lọc đã đặt:\n"
+                    f"  Lĩnh vực: {f_str}\n"
+                    f"  Hình thức: {m_str}\n"
+                    f"  Phạm vi:   {s_str}\n"
+                )
+
+            _reply(
+                token, chat_id,
+                f"{extra}\nGõ từ khóa cần tìm (hoặc gửi - để tìm chỉ theo bộ lọc):\n\n"
+                "  camera\n"
+                "  camera & lâm đồng   (AND — tất cả phải khớp)\n"
+                "  camera | cctv       (OR — bất kỳ khớp)\n\n"
+                "/hủy để thoát.",
+                reply_markup=_kb([[_btn("❌ Hủy", "huy")]]),
+            )
+            return
+
+        # Cập nhật panel sau khi thay đổi field/method/scope/reset
+        _show_loc_panel(token, chat_id, fstate)
         return
 
     logger.debug("Unhandled callback_data: {!r}", data)

@@ -121,13 +121,21 @@ def build_tbmt_payload(
     page_size: int = 50,
     *,
     open_only: bool = True,
+    field_filter: Optional[list[str]] = None,
+    bid_method_filter: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """TBMT mới — không lọc từ server (cron).
 
     open_only=True (mặc định): chỉ gói chưa đóng thầu.
     open_only=False: tất cả gói kể cả đã đóng.
+    field_filter: danh sách mã lĩnh vực ES (vd. ["HH", "XL"]) — None = tất cả.
+    bid_method_filter: 1 = qua mạng, 0 = không qua mạng, None = tất cả.
     """
     filters = _open_tbmt_filters() if open_only else _all_tbmt_filters()
+    if field_filter:
+        filters.append({"fieldName": "investField", "searchType": "in", "fieldValues": list(field_filter)})
+    if bid_method_filter is not None:
+        filters.append({"fieldName": "isInternet", "searchType": "in", "fieldValues": [bid_method_filter]})
     return [
         {
             "pageSize": page_size,
@@ -153,11 +161,15 @@ def build_tbmt_keyword_payload(
     match_type: str = "all-1",
     include_investor_fields: bool = True,
     open_only: bool = True,
+    field_filter: Optional[list[str]] = None,
+    bid_method_filter: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """Tra TBMT theo từ khóa — mặc định gồm cả chủ đầu tư/BMT (giống cổng khi tích tìm theo cơ quan).
 
     open_only=True  → chỉ gói chưa đóng thầu (mặc định, dùng cho cron + /tim)
     open_only=False → tất cả gói kể cả đã đóng (dùng cho /timtat)
+    field_filter: danh sách mã lĩnh vực ES (vd. ["HH", "XL"]) — None = tất cả.
+    bid_method_filter: 1 = qua mạng, 0 = không qua mạng, None = tất cả.
     """
     kw = (keyword or "").strip()
     fields: list[str] = ["notifyNo", "bidName"]
@@ -171,6 +183,10 @@ def build_tbmt_keyword_payload(
             ]
         )
     filters = _open_tbmt_filters() if open_only else _all_tbmt_filters()
+    if field_filter:
+        filters.append({"fieldName": "investField", "searchType": "in", "fieldValues": list(field_filter)})
+    if bid_method_filter is not None:
+        filters.append({"fieldName": "isInternet", "searchType": "in", "fieldValues": [bid_method_filter]})
     return [
         {
             "pageSize": page_size,
@@ -297,6 +313,8 @@ class MuasamcongCrawler:
         max_pages_cap: int = 10,
         server_keyword: Optional[str] = None,
         open_only: bool = True,
+        field_filter: Optional[list[str]] = None,
+        bid_method_filter: Optional[int] = None,
     ) -> list:
         from .models import Bid
 
@@ -316,7 +334,13 @@ class MuasamcongCrawler:
                     page + 1,
                     max_pages,
                 )
-                page_bids = self._fetch_page(page, server_keyword=sk, open_only=open_only)
+                page_bids = self._fetch_page(
+                    page,
+                    server_keyword=sk,
+                    open_only=open_only,
+                    field_filter=field_filter,
+                    bid_method_filter=bid_method_filter,
+                )
                 if not page_bids:
                     break
                 bids.extend(page_bids)
@@ -343,6 +367,8 @@ class MuasamcongCrawler:
         server_keyword: Optional[str] = None,
         *,
         open_only: bool = True,
+        field_filter: Optional[list[str]] = None,
+        bid_method_filter: Optional[int] = None,
     ) -> list:
         from .models import Bid
 
@@ -352,12 +378,16 @@ class MuasamcongCrawler:
                 page_size=self.page_size,
                 keyword=server_keyword,
                 open_only=open_only,
+                field_filter=field_filter,
+                bid_method_filter=bid_method_filter,
             )
         else:
             payload = build_tbmt_payload(
                 page_number=page,
                 page_size=self.page_size,
                 open_only=open_only,
+                field_filter=field_filter,
+                bid_method_filter=bid_method_filter,
             )
         data = self._search(payload)
         if isinstance(data, (int, float)):
