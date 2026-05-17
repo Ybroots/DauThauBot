@@ -315,6 +315,7 @@ class MuasamcongCrawler:
         open_only: bool = True,
         field_filter: Optional[list[str]] = None,
         bid_method_filter: Optional[int] = None,
+        match_type: str = "all-1",
     ) -> list:
         from .models import Bid
 
@@ -340,6 +341,7 @@ class MuasamcongCrawler:
                     open_only=open_only,
                     field_filter=field_filter,
                     bid_method_filter=bid_method_filter,
+                    match_type=match_type,
                 )
                 if not page_bids:
                     break
@@ -369,6 +371,7 @@ class MuasamcongCrawler:
         open_only: bool = True,
         field_filter: Optional[list[str]] = None,
         bid_method_filter: Optional[int] = None,
+        match_type: str = "all-1",
     ) -> list:
         from .models import Bid
 
@@ -377,6 +380,7 @@ class MuasamcongCrawler:
                 page_number=page,
                 page_size=self.page_size,
                 keyword=server_keyword,
+                match_type=match_type,
                 open_only=open_only,
                 field_filter=field_filter,
                 bid_method_filter=bid_method_filter,
@@ -857,6 +861,7 @@ class MuasamcongCrawler:
         open_only: bool = True,
         field_filter: Optional[list[str]] = None,
         bid_method_filter: Optional[int] = None,
+        match_type: str = "any",
     ) -> dict[str, list]:
         """Cào nhiều phrase trong 1 Playwright session (batch) — thay vì N session riêng lẻ.
 
@@ -885,6 +890,7 @@ class MuasamcongCrawler:
                         page_number=pg,
                         page_size=self.page_size,
                         keyword=sk,
+                        match_type=match_type,
                         open_only=open_only,
                         field_filter=field_filter,
                         bid_method_filter=bid_method_filter,

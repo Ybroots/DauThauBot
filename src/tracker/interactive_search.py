@@ -196,11 +196,11 @@ def run_interactive_keyword_search(
             _cache_put(cache_key, bids)
         elif require == "all" and len(uniq) >= 2:
             # ── AND optimisation: join all phrases → 1 ES keyword → 1 session ─
-            # ES "all-1" tokenises by space, so joining with space is equivalent
-            # to requiring all tokens present in indexed fields.
+            # matchType "any" + combined keyword → ES trả mọi gói có bất kỳ token nào
+            # client-side match_bid(require="all") lọc AND chính xác sau đó.
             combined_kw = " ".join(uniq)
             logger.info(
-                "interactive_fetch: AND batch — combined keyword='{}' (1 session instead of {})",
+                "interactive_fetch: AND batch — combined keyword='{}' matchType=any (1 session instead of {})",
                 combined_kw, len(uniq),
             )
             part = crawler.fetch_recent_bids(
@@ -209,19 +209,21 @@ def run_interactive_keyword_search(
                 open_only=open_only,
                 field_filter=field_filter,
                 bid_method_filter=bid_method_filter,
+                match_type="any",
             )
             for b in part:
                 by_code.setdefault(b.tbmt_code, b)
             bids = list(by_code.values())
             _cache_put(cache_key, bids)
         elif len(uniq) == 1:
-            # ── Single phrase (OR or AND with 1 term) ─────────────────────────
+            # ── Single phrase — matchType "any" để ES trả nhiều candidate hơn ─
             part = crawler.fetch_recent_bids(
                 max_pages=max_pages,
                 server_keyword=uniq[0],
                 open_only=open_only,
                 field_filter=field_filter,
                 bid_method_filter=bid_method_filter,
+                match_type="any",
             )
             for b in part:
                 by_code.setdefault(b.tbmt_code, b)
@@ -230,7 +232,7 @@ def run_interactive_keyword_search(
         else:
             # ── OR mode multi-phrase: batch (1 Playwright session) ────────────
             logger.info(
-                "interactive_fetch: OR batch — {} phrases → 1 Playwright session",
+                "interactive_fetch: OR batch — {} phrases → 1 Playwright session (matchType=any)",
                 len(uniq),
             )
             phrase_map = crawler.fetch_recent_bids_multi(
@@ -239,6 +241,7 @@ def run_interactive_keyword_search(
                 open_only=open_only,
                 field_filter=field_filter,
                 bid_method_filter=bid_method_filter,
+                match_type="any",
             )
             for bids_for_phrase in phrase_map.values():
                 for b in bids_for_phrase:
