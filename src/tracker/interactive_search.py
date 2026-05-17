@@ -344,15 +344,23 @@ def run_interactive_keyword_search(
                 summary = f"Tìm thấy {total} gói{closed_note}{cache_note}. Đã gửi {sent} tin." + filter_suffix
             else:
                 summary = f"Tìm thấy {total} gói [{mode_display}]{closed_note}{cache_note}. Đã gửi {sent} tin." + filter_suffix
-                if total == 1 and n_from_portal > 1:
+                if total <= 3 and not include_closed and not is_filter_only:
+                    # Gợi ý thử /timtat và AND mode khi kết quả ít
+                    kw_sample = " ".join(uniq[:2]) if uniq else ""
+                    summary += (
+                        f"\n💡 Trên cổng thấy nhiều hơn? Bot chỉ tìm gói đang mở thầu — "
+                        f"thử /timtat {kw_sample} để tìm cả gói đã đóng."
+                    )
+                    if len(uniq) == 1 and " " in (uniq[0] if uniq else ""):
+                        words = (uniq[0] if uniq else "").split()
+                        if len(words) >= 3:
+                            # Gợi ý AND mode với từ khóa ngắn hơn
+                            short = " & ".join(words[i] for i in [0, -1])
+                            summary += f"\nHoặc thử: {short} (tìm rộng hơn theo 2 từ khóa độc lập)."
+                if total == 1 and n_from_portal > 1 and not (total <= 3 and not include_closed and not is_filter_only):
                     summary += (
                         f"\nLưu ý: đã cào ~{max_slots} ô; API trả {n_from_portal} gói, "
                         f"chỉ 1 gói đáp ứng đủ điều kiện lọc."
-                    )
-                elif total == 1 and n_from_portal == 1:
-                    summary += (
-                        f" Trong phạm vi đã cào ({max_pages} trang ES), "
-                        f"cổng chỉ trả đúng 1 gói TBMT ({scope_label}) khớp tìm kiếm."
                     )
 
         return sent, total, summary
