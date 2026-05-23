@@ -13,7 +13,7 @@ from tenacity import RetryError
 from .config import Secrets, load_keywords_yaml
 from .crawler import BlockedException, MuasamcongCrawler
 from .filter import explain_match, match_bid
-from .formatter import format_bid_detail
+from .formatter import format_bid_detail, format_bid_message
 from .interactive_search import parse_keyword_phrases, parse_search_query, run_interactive_keyword_search
 from .keyword_suggest import (
     build_suggest_reply,
@@ -58,6 +58,12 @@ _last_search_ts: dict[str, float] = {}
 # State cho luồng /goiy — gợi ý từ khóa có hướng dẫn
 # { state_key: { "accumulated": [str], "bids": [Bid], "suggestions": [(str,int)] } }
 _suggest_state: dict[str, dict] = {}
+
+# State cho auto-suggest hẹp dần sau /tim — riêng với /goiy vì UX khác:
+# /tim narrow click → re-emit bid cụ thể; /goiy click → summary đếm.
+# { state_key: { "phrases": [str], "bids": [Bid], "suggestions": [(str,int)],
+#                "include_closed": bool, "chat_scope_key": str } }
+_narrow_state: dict[str, dict] = {}
 
 # State cho luồng /loc — bộ lọc tìm kiếm nâng cao
 # { state_key: { "fields": list[str], "method": int|None, "closed": bool } }
@@ -399,6 +405,25 @@ def _suggest_kb(suggestions: list[tuple[str, int]]) -> dict:
     return _kb(rows)
 
 
+def _narrow_kb(suggestions: list[tuple[str, int]]) -> dict:
+    """Keyboard auto-suggest sau /tim — click để hẹp dần kết quả (re-emit bid)."""
+    rows: list[list[dict]] = []
+    # 2 nút mỗi dòng để gọn
+    pair: list[dict] = []
+    for i, (term, count) in enumerate(suggestions):
+        label = f"+ {term} ({count})"
+        if len(label.encode("utf-8")) > 30:
+            label = f"+ {term[:14]}… ({count})"
+        pair.append(_btn(label, f"nrw|{i}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([_btn("✖ Bỏ gợi ý", "nrw|cancel"), _btn("🏠 Menu", "menu")])
+    return _kb(rows)
+
+
 def _answer_callback(token: str, callback_query_id: str, text: str = "") -> None:
     """Acknowledge a callback_query (required within 10s or Telegram shows spinner)."""
     try:
@@ -456,7 +481,7 @@ def _execute_search(
         f"Đang tra Muasamcong — {kw_note}{mode_note}{scope_note}{filter_note}\n(Playwright có thể mất 30–90 giây)…",
     )
     try:
-        sent, total, summary = run_interactive_keyword_search(
+        sent, total, summary, matched_bids = run_interactive_keyword_search(
             secrets,
             phrases,
             target_chat_id=target_chat_id,
@@ -477,6 +502,15 @@ def _execute_search(
             target_chat_id,
             summary,
             reply_markup=_after_search_kb(include_closed),
+        )
+        # Auto-suggest hẹp dần — chỉ khi có ≥ 3 bid matched & có gợi ý hữu ích
+        _maybe_send_narrow_suggestions(
+            secrets,
+            target_chat_id,
+            chat_scope_key,
+            phrases=phrases,
+            bids=matched_bids,
+            include_closed=include_closed,
         )
     except BlockedException as e:
         _reply(
@@ -515,6 +549,119 @@ def _execute_search(
             "Lỗi khi cào hoặc gửi Telegram. Xem logs/ trên máy chạy bot.",
             reply_markup=_after_search_kb(include_closed),
         )
+
+
+def _maybe_send_narrow_suggestions(
+    secrets: Secrets,
+    target_chat_id: str | int,
+    chat_scope_key: str,
+    *,
+    phrases: list[str],
+    bids: list,
+    include_closed: bool,
+) -> None:
+    """Sau /tim, gửi keyboard 'Hẹp dần thêm với:' nếu có ≥ 3 bid + có suggestion."""
+    # Ngưỡng: dưới 3 bid không cần hẹp; trên N rất nhiều cũng có ích — luôn show
+    if not bids or len(bids) < 3:
+        return
+    suggestions = extract_suggestions(bids, accumulated=list(phrases))
+    if not suggestions:
+        return
+
+    ukey = chat_scope_key  # cùng scope với cooldown
+    _narrow_state[ukey] = {
+        "phrases": list(phrases),
+        "bids": list(bids),
+        "suggestions": suggestions,
+        "include_closed": include_closed,
+    }
+    kw_summary = " + ".join(f'"{p}"' for p in phrases) if phrases else "(lọc)"
+    text = (
+        f"🔍 Bot gợi ý hẹp tiếp từ {len(bids)} gói khớp {kw_summary}.\n"
+        "Click một từ để lọc nhanh (không cào lại):"
+    )
+    _reply(
+        secrets.telegram_bot_token,
+        target_chat_id,
+        text,
+        reply_markup=_narrow_kb(suggestions),
+    )
+
+
+def _execute_narrow_click(
+    secrets: Secrets,
+    target_chat_id: str | int,
+    chat_scope_key: str,
+    chosen_idx: int,
+) -> None:
+    """Xử lý click nút nrw|<idx>: filter in-memory + re-emit bid + show new suggestions."""
+    state = _narrow_state.get(chat_scope_key)
+    if not state:
+        _reply(
+            secrets.telegram_bot_token,
+            target_chat_id,
+            "Gợi ý đã hết hạn. Gõ /tim để tra lại.",
+            reply_markup=_kb([[_btn("🔍 Tìm", "search|open"), _btn("🏠 Menu", "menu")]]),
+        )
+        return
+
+    suggestions = state["suggestions"]
+    if chosen_idx < 0 or chosen_idx >= len(suggestions):
+        _reply(secrets.telegram_bot_token, target_chat_id, "Nút không hợp lệ.")
+        return
+
+    chosen_term, _ = suggestions[chosen_idx]
+    accumulated = state["phrases"] + [chosen_term]
+    filtered = filter_bids_by_terms(state["bids"], accumulated)
+
+    token = secrets.telegram_bot_token
+    cid = str(target_chat_id)
+    kw_summary = " + ".join(f'"{p}"' for p in accumulated)
+
+    if not filtered:
+        _narrow_state.pop(chat_scope_key, None)
+        _reply(
+            token, target_chat_id,
+            f"❌ Không còn gói khớp {kw_summary}. Thử từ khác hoặc /tim lại.",
+            reply_markup=_after_search_kb(state.get("include_closed", False)),
+        )
+        return
+
+    # Re-emit filtered bids (cap như /tim)
+    cap = secrets.interactive_search_max_messages
+    to_emit = filtered[:cap]
+    sent = 0
+    from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, chitiet_button, send_message
+    for i, bid in enumerate(to_emit):
+        if i > 0 and i % TELEGRAM_RATE_BATCH == 0:
+            time.sleep(TELEGRAM_BATCH_SLEEP_S)
+        body = format_bid_message(bid, accumulated)
+        if send_message(token, cid, body, reply_markup=chitiet_button(bid.tbmt_code)):
+            sent += 1
+
+    # New suggestions từ tập đã hẹp
+    new_suggestions = extract_suggestions(filtered, accumulated=accumulated)
+    capped_note = (
+        f" (đã gửi {sent}/{len(filtered)}, giới hạn {cap})" if len(filtered) > cap else f" (đã gửi {sent})"
+    )
+    summary = f"🔎 Hẹp dần với {kw_summary} → còn {len(filtered)} gói{capped_note}."
+
+    if new_suggestions and len(filtered) >= 3:
+        _narrow_state[chat_scope_key] = {
+            **state,
+            "phrases": accumulated,
+            "bids": filtered,
+            "suggestions": new_suggestions,
+        }
+        _reply(
+            token, target_chat_id,
+            summary + "\nClick để hẹp thêm:",
+            reply_markup=_narrow_kb(new_suggestions),
+        )
+    else:
+        _narrow_state.pop(chat_scope_key, None)
+        _reply(token, target_chat_id, summary,
+               reply_markup=_after_search_kb(state.get("include_closed", False)))
 
 
 def _execute_detail_fetch(
@@ -632,7 +779,8 @@ def HELP_VI() -> str:
         "• /tim camera | cctv             — OR: bất kỳ khớp\n"
         "• /tim camera & lâm đồng        — AND: tất cả phải khớp\n"
         "• /tim Công an tỉnh Lâm Đồng    — tìm theo tên cơ quan\n"
-        "• /tim camera & lâm đồng & giám sát — AND 3 điều kiện\n\n"
+        "• /tim camera & lâm đồng & giám sát — AND 3 điều kiện\n"
+        "  💡 Sau khi /tim, bot gợi ý nút 'Hẹp dần thêm' — click để lọc nhanh.\n\n"
         "Tìm kể cả gói đã đóng thầu:\n"
         "• /timtat Công an tỉnh Lâm Đồng — tìm tất cả (mở + đóng)\n"
         "• /timtat camera & lâm đồng     — AND mode, bao gồm đã đóng\n"
@@ -1813,6 +1961,21 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
             _reply(token, chat_id, "Nút Chi tiết không có mã.")
             return
         _execute_detail_fetch(secrets, code, chat_id, cid_s)
+        return
+
+    # ── nrw|<idx> hoặc nrw|cancel — auto-suggest hẹp dần sau /tim ────────
+    if data.startswith("nrw|"):
+        arg = data[4:].strip()
+        if arg == "cancel":
+            _narrow_state.pop(cid_s, None)
+            _reply(token, chat_id, "Đã tắt gợi ý.", reply_markup=_main_menu_kb())
+            return
+        try:
+            idx = int(arg)
+        except ValueError:
+            _reply(token, chat_id, "Nút không hợp lệ.")
+            return
+        _execute_narrow_click(secrets, chat_id, cid_s, idx)
         return
 
     # ── hint|addgroup ─────────────────────────────────────────────────────

@@ -113,7 +113,7 @@ def run_interactive_keyword_search(
     include_closed: bool = False,
     field_filter: list[str] | None = None,
     bid_method_filter: int | None = None,
-) -> tuple[int, int, str]:
+) -> tuple[int, int, str, list]:
     """Cào theo interactive_fetch_max_pages; gửi tối đa N tin HTML tới một chat.
 
     mode="any"  → OR: bid khớp ít nhất 1 phrase.
@@ -127,8 +127,8 @@ def run_interactive_keyword_search(
     • Cache: kết quả được cache 5 phút — tra lại cùng query gần như tức thì.
     • Relevance sort: matched bids sắp xếp theo số phrase khớp, số match trong title.
 
-    Returns (sent_count, total_matching, summary_plain).
-    Không đụng vào SQLite.
+    Returns (sent_count, total_matching, summary_plain, matched_bids).
+    matched_bids dùng cho auto-suggest hẹp dần sau khi gửi xong (không đụng SQLite).
     """
     require: str = mode if mode in ("all", "any") else "any"
     cap = secrets.interactive_search_max_messages
@@ -363,7 +363,8 @@ def run_interactive_keyword_search(
                         f"chỉ 1 gói đáp ứng đủ điều kiện lọc."
                     )
 
-        return sent, total, summary
+        matched_bids = [t[0] for t in matched]
+        return sent, total, summary, matched_bids
     finally:
         crawler.close()
 
