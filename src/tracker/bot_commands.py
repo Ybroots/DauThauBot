@@ -28,6 +28,8 @@ from .storage import (
     count_sent_since,
     count_sent_since_hours,
     count_unsent_in_db,
+    disable_all_groups,
+    enable_all_groups,
     get_group_by_id,
     init_db,
     list_all_groups_raw,
@@ -36,6 +38,7 @@ from .storage import (
     list_unsent,
     load_groups_from_db,
     lookup_bid_in_db,
+    remove_all_groups,
     remove_bid_from_db,
     remove_group,
     remove_keyword_from_group,
@@ -799,6 +802,7 @@ def HELP_VI() -> str:
         "• /goiy lâm đồng — bot cào cổng, gợi ý từ liên quan\n"
         "  → chọn số để hẹp dần → /taogroup để lưu\n\n"
         "Quản lý keyword groups (AND/OR logic):\n"
+        "• /trangthai — xem tổng quan: groups + cron + stats 24h\n"
         "• /groups — xem tất cả groups (gồm cả group đang tắt)\n"
         "• /addgroup Tên | all | kw1, kw2 — tạo group AND\n"
         "• /addgroup Tên | any | kw1, kw2 — tạo group OR\n"
@@ -808,6 +812,9 @@ def HELP_VI() -> str:
         "• /renamegroup Tên cũ | Tên mới — đổi tên group\n"
         "• /tatgroup Tên — tắt group (cron bỏ qua, vẫn tra được bằng /timgroup)\n"
         "• /batgroup Tên — bật lại group đã tắt\n"
+        "• /tatallgroup — tắt TẤT CẢ tạm thời (cron rảnh)\n"
+        "• /batallgroup — bật lại tất cả\n"
+        "• /huyhetgroup — XÓA HẾT group (reset, có confirm)\n"
         "• /timgroup Tên — tìm kiếm ngay theo từ khóa của group\n"
         "• /testkw từ khóa thử — debug group nào match\n\n"
         "Quản lý dữ liệu:\n"
@@ -829,11 +836,13 @@ def COMMAND_LIST_VI() -> str:
         "• /goiy kw — gợi ý từ liên quan, hẹp dần → /taogroup\n"
         "• /loc — bộ lọc nâng cao (lĩnh vực, hình thức, phạm vi)\n"
         "\nQuản lý groups:\n"
+        "• /trangthai — tổng quan groups + cron + stats\n"
         "• /groups — xem tất cả groups (gồm cả tắt)\n"
         "• /addgroup Tên | all|any | kw1, kw2\n"
         "• /removegroup /renamegroup /addkw /removekw\n"
-        "• /tatgroup Tên — tắt group khỏi cron\n"
-        "• /batgroup Tên — bật lại group\n"
+        "• /tatgroup /batgroup Tên — tắt/bật một group\n"
+        "• /tatallgroup /batallgroup — tắt/bật tất cả\n"
+        "• /huyhetgroup — xóa hết (reset, có confirm)\n"
         "• /testkw từ khóa — debug group nào match\n"
         "\nDữ liệu:\n"
         "• /chitiet MÃ — đọc chi tiết gói trên cổng (auto fill)\n"
@@ -1120,6 +1129,97 @@ def handle_slash(
             return f'Không tìm thấy group "{name}". Xem /groups.'
         return f'▶️ Group "{name}" đã bật — cron sẽ dùng lại group này.'
 
+    if cmd in ("/trangthai", "/status"):
+        init_db()
+        all_groups = list_all_groups_raw()
+        active = [g for g in all_groups if g[3]]
+        inactive = [g for g in all_groups if not g[3]]
+        total_active_kws = sum(len(g[4]) for g in active)
+
+        from datetime import datetime as _dt, timezone as _tz
+        utc_now = _dt.now(_tz.utc).strftime("%d/%m %H:%M")
+        h24 = count_sent_since_hours(24)
+        d7 = count_sent_since(7)
+        tot_db = total_bids_in_db()
+        unsent_db = count_unsent_in_db()
+
+        lines = ["📊 <b>Trạng thái DauThauBot</b>", ""]
+
+        # Section 1: Keyword groups
+        lines.append("<b>1. Keyword groups (cron đang theo dõi)</b>")
+        if not all_groups:
+            lines.append("  ⚠️ Chưa có group nào — cron sẽ chạy nhưng không lọc gì.")
+            lines.append("  Dùng /addgroup để tạo, hoặc /goiy để gợi ý từ data thực.")
+        else:
+            lines.append(
+                f"  ▶ Đang bật: <b>{len(active)}</b> group ({total_active_kws} từ khóa)"
+            )
+            if inactive:
+                lines.append(f"  ⏸ Tạm tắt: {len(inactive)} group")
+            for g in active[:10]:
+                gid, name, require, _, kws = g
+                req_lbl = "AND" if require == "all" else "OR"
+                kw_preview = ", ".join(kws[:3]) + (f"… +{len(kws)-3}" if len(kws) > 3 else "")
+                name_esc = html.escape(name)
+                kw_esc = html.escape(kw_preview)
+                lines.append(f"   • <b>{name_esc}</b> [{req_lbl}] — {kw_esc}")
+            if len(active) > 10:
+                lines.append(f"   … và {len(active)-10} group nữa (xem /groups)")
+
+        # Section 2: Cron config
+        lines += [
+            "",
+            "<b>2. Cron / thiết lập cào</b>",
+            f"  • Chu kỳ: <b>{secrets.poll_interval_minutes} phút</b> (±{secrets.poll_jitter_seconds}s jitter)",
+            f"  • Giờ yên (VN): {secrets.quiet_hours_start}–{secrets.quiet_hours_end}",
+            f"  • Mỗi lần cào: {secrets.crawl_max_pages} trang × {secrets.crawl_page_size} gói",
+            f"  • Per-keyword: {'bật' if secrets.crawl_per_keyword else 'tắt'}",
+            f"  • Playwright: {'on' if secrets.use_playwright else 'off'} "
+            f"(headless={'on' if secrets.playwright_headless else 'off'})",
+        ]
+
+        # Section 3: Stats
+        lines += [
+            "",
+            "<b>3. Hoạt động</b>",
+            f"  • Đã gửi 24h: <b>{h24}</b> | 7 ngày: {d7}",
+            f"  • Tổng trong DB: {tot_db} (chưa gửi: {unsent_db})",
+            f"  • Bây giờ (UTC): {utc_now}",
+        ]
+
+        # Section 4: Lệnh quản lý
+        lines += [
+            "",
+            "<b>4. Quản lý nhanh</b>",
+            "  /tatallgroup — tạm tắt tất cả (cron rảnh)",
+            "  /batallgroup — bật lại tất cả",
+            "  /huyhetgroup — xóa hết group (reset, cần confirm)",
+            "  /addgroup, /addkw — thêm group/từ khóa",
+        ]
+        return "\n".join(lines)
+
+    if cmd in ("/tatallgroup", "/disableall"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /tatallgroup chỉ dành cho admin."
+        init_db()
+        n = disable_all_groups()
+        if n == 0:
+            return "Không có group nào đang bật — không cần tắt."
+        return (
+            f"⏸ Đã tắt {n} group. Cron sẽ KHÔNG dùng từ khóa nào nữa "
+            "(vẫn cào TBMT mới nhưng không lọc).\n"
+            "/batallgroup để bật lại, /groups để xem."
+        )
+
+    if cmd in ("/batallgroup", "/enableall"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
+            return "Lệnh /batallgroup chỉ dành cho admin."
+        init_db()
+        n = enable_all_groups()
+        if n == 0:
+            return "Tất cả group đã bật sẵn."
+        return f"▶️ Đã bật lại {n} group. Cron sẽ dùng lại các từ khóa."
+
     if cmd in ("/timhom", "/today"):
         hours = _parse_positive_int(rest, default=24, max_v=168, min_v=1)
         init_db()
@@ -1366,6 +1466,33 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         _execute_detail_fetch(secrets, rest, chat_id, cid_s)
         return
 
+    if cmd in ("/huyhetgroup", "/wipegroups", "/resetgroups"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=int(uid)):
+            _reply(bot_token, chat_id, "Lệnh /huyhetgroup chỉ dành cho admin.")
+            return
+        init_db()
+        all_groups = list_all_groups_raw()
+        if not all_groups:
+            _reply(bot_token, chat_id, "Không có group nào để xóa — DB trống rồi.")
+            return
+        total_kws = sum(len(g[4]) for g in all_groups)
+        _reply(
+            bot_token,
+            chat_id,
+            (
+                f"⚠️ <b>XÓA TẤT CẢ KEYWORD GROUPS</b>\n\n"
+                f"Sẽ xóa: <b>{len(all_groups)}</b> group ({total_kws} từ khóa).\n"
+                "Không đụng vào seen.db (lịch sử bid vẫn còn).\n\n"
+                "Bấm XÁC NHẬN để xóa, hoặc Hủy để giữ nguyên."
+            ),
+            parse_html=True,
+            reply_markup=_kb([
+                [_btn("✅ XÁC NHẬN XÓA HẾT", "wipeall|confirm")],
+                [_btn("❌ Hủy", "wipeall|cancel"), _btn("🏠 Menu", "menu")],
+            ]),
+        )
+        return
+
     if cmd in ("/timgroup",):
         # Tìm kiếm theo từ khóa của một keyword group đã lưu
         name = rest.strip()
@@ -1419,12 +1546,14 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         user_id=int(uid),
     )
     if routed:
-        parse_html_cmds = ("/id", "/ma", "/xem", "/lookup")
+        parse_html_cmds = ("/id", "/ma", "/xem", "/lookup", "/trangthai", "/status")
         kb: Optional[dict] = None
         _groups_cmds = (
             "/groups", "/keywords",
             "/addgroup", "/removegroup", "/addkw", "/removekw",
             "/renamegroup", "/tatgroup", "/disablegroup", "/batgroup", "/enablegroup",
+            "/tatallgroup", "/disableall", "/batallgroup", "/enableall",
+            "/trangthai", "/status",
             "/taogroup", "/testkw",
         )
         _stats_cmds = ("/thongke", "/dashboard", "/stats")
@@ -1962,6 +2091,27 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
             return
         _execute_detail_fetch(secrets, code, chat_id, cid_s)
         return
+
+    # ── wipeall|confirm hoặc wipeall|cancel — xóa hết keyword groups ────
+    if data.startswith("wipeall|"):
+        if not _is_privileged(secrets, chat_id=chat_id, user_id=int(uid)):
+            _reply(token, chat_id, "Chỉ admin được dùng.")
+            return
+        choice = data[len("wipeall|"):]
+        if choice == "cancel":
+            _reply(token, chat_id, "❎ Đã hủy. Group giữ nguyên.",
+                   reply_markup=_main_menu_kb())
+            return
+        if choice == "confirm":
+            init_db()
+            n = remove_all_groups()
+            _reply(
+                token, chat_id,
+                f"🗑 Đã xóa {n} group. seen.db không bị ảnh hưởng.\n"
+                "Cron sẽ chạy nhưng không lọc cho đến khi bạn /addgroup hoặc /goiy.",
+                reply_markup=_main_menu_kb(),
+            )
+            return
 
     # ── nrw|<idx> hoặc nrw|cancel — auto-suggest hẹp dần sau /tim ────────
     if data.startswith("nrw|"):

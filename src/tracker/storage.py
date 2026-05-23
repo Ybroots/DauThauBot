@@ -450,6 +450,31 @@ def list_all_groups_raw() -> list[tuple[int, str, str, int, list[str]]]:
         return result
 
 
+def disable_all_groups() -> int:
+    """Tắt tất cả group đang bật. Trả về số group đã đổi từ on→off."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("UPDATE keyword_groups SET active = 0 WHERE active = 1")
+        return cur.rowcount
+
+
+def enable_all_groups() -> int:
+    """Bật tất cả group đang tắt. Trả về số group đã đổi từ off→on."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("UPDATE keyword_groups SET active = 1 WHERE active = 0")
+        return cur.rowcount
+
+
+def remove_all_groups() -> int:
+    """Xóa TẤT CẢ keyword groups (và keywords nhờ ON DELETE CASCADE).
+
+    Trả về số group đã xóa. KHÔNG đụng vào seen_bids — tracker history vẫn còn.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cur = conn.execute("DELETE FROM keyword_groups")
+        return cur.rowcount
+
+
 def get_group_by_id(gid: int) -> tuple[str, str, list[str]] | None:
     """Tra group theo DB id. Trả về (name, require, [keywords]) hoặc None."""
     with sqlite3.connect(DB_PATH) as conn:
