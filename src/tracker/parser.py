@@ -249,8 +249,36 @@ def parse_tbmt_input(raw: str) -> tuple[str, Optional[str]]:
     return "", None
 
 
+def _fmt_vn_datetime(value: Any) -> str:
+    """ISO/UTC → 'HH:MM dd/mm/YYYY' giờ VN (+7). '' nếu không parse được."""
+    if not value:
+        return ""
+    try:
+        dt = _parse_dt(value)
+        # _parse_dt trả tz-aware UTC; cộng 7 giờ cho giờ VN trong hiển thị
+        from datetime import timedelta
+        vn = dt + timedelta(hours=7)
+        return vn.strftime("%H:%M %d/%m/%Y")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def extract_bid_extras(item: dict[str, Any]) -> dict[str, str]:
-    """Trả các trường detail bổ sung (decoded) chưa có trong dataclass Bid."""
+    """Trả các trường detail bổ sung (decoded) chưa có trong dataclass Bid.
+
+    Surface tất cả field có ích trong search response — kể cả những field bot
+    chưa hiển thị trước đây (bidOpenDate, numBidderTech, numPetition*…)
+    để /chitiet giàu thông tin hơn mà không cần gọi detail API riêng.
+    """
     if not isinstance(item, dict):
         return {}
     extras: dict[str, str] = {}
@@ -275,6 +303,50 @@ def extract_bid_extras(item: dict[str, Any]) -> dict[str, str]:
     process = _label(PROCESS_APPLY_NAMES, item.get("processApply"))
     if process:
         extras["Luật áp dụng"] = process
+
+    # Thời gian mở thầu — KHÁC bidCloseDate (= hạn nộp HSDT). Cổng phân biệt rõ.
+    open_dt = _fmt_vn_datetime(item.get("bidOpenDate"))
+    if open_dt:
+        extras["Mở thầu"] = open_dt
+
+    # Đăng lần đầu — khác publicDate khi gói đã được sửa/cập nhật
+    orig = item.get("originalPublicDate")
+    pub = item.get("publicDate")
+    if orig and orig != pub:
+        orig_fmt = _fmt_vn_datetime(orig)
+        if orig_fmt:
+            extras["Đăng lần đầu"] = orig_fmt
+
+    # Đã có nhà thầu đăng ký HSDT
+    n_tech = _safe_int(item.get("numBidderTech"))
+    if n_tech and n_tech > 0:
+        extras["Nhà thầu đã đăng ký"] = str(n_tech)
+
+    # Yêu cầu làm rõ
+    n_clarify = _safe_int(item.get("numClarifyReq"))
+    if n_clarify and n_clarify > 0:
+        extras["Yêu cầu làm rõ"] = str(n_clarify)
+
+    # Tổng khiếu nại (HSMT + LCNT + KQLCNT + general)
+    n_pet = sum(
+        v for v in (
+            _safe_int(item.get("numPetition")),
+            _safe_int(item.get("numPetitionHsmt")),
+            _safe_int(item.get("numPetitionLcnt")),
+            _safe_int(item.get("numPetitionKqlcnt")),
+        ) if v is not None
+    )
+    if n_pet > 0:
+        extras["Khiếu nại / kiến nghị"] = str(n_pet)
+
+    # Tag gói đặc biệt
+    tags: list[str] = []
+    if item.get("isMedicine") == 1:
+        tags.append("Gói thuốc")
+    if item.get("isDomestic") == 1:
+        tags.append("Đấu thầu trong nước")
+    if tags:
+        extras["Tag"] = " · ".join(tags)
 
     estimate = item.get("bidEstimatePrice")
     price = item.get("bidPrice")

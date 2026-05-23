@@ -70,6 +70,74 @@ def test_extract_bid_extras_drops_undefined():
     assert "Kế hoạch số" not in extras
 
 
+def test_extract_bid_extras_includes_open_date():
+    extras = extract_bid_extras({"bidOpenDate": "2026-06-02T08:00:00.000Z"})
+    # UTC 08:00 + 7h = 15:00 VN
+    assert extras.get("Mở thầu") == "15:00 02/06/2026"
+
+
+def test_extract_bid_extras_original_public_date_only_if_different():
+    same = extract_bid_extras({
+        "publicDate": "2026-05-22T08:00:00Z",
+        "originalPublicDate": "2026-05-22T08:00:00Z",
+    })
+    assert "Đăng lần đầu" not in same
+
+    diff = extract_bid_extras({
+        "publicDate": "2026-05-22T08:00:00Z",
+        "originalPublicDate": "2026-05-20T08:00:00Z",
+    })
+    assert diff.get("Đăng lần đầu") == "15:00 20/05/2026"
+
+
+def test_extract_bid_extras_zero_counts_hidden():
+    extras = extract_bid_extras({
+        "numBidderTech": 0,
+        "numClarifyReq": 0,
+        "numPetition": 0,
+    })
+    assert "Nhà thầu đã đăng ký" not in extras
+    assert "Yêu cầu làm rõ" not in extras
+    assert "Khiếu nại / kiến nghị" not in extras
+
+
+def test_extract_bid_extras_aggregates_petition_counts():
+    extras = extract_bid_extras({
+        "numPetition": 1,
+        "numPetitionHsmt": 2,
+        "numPetitionLcnt": 0,
+        "numPetitionKqlcnt": 1,
+    })
+    assert extras.get("Khiếu nại / kiến nghị") == "4"
+
+
+def test_extract_bid_extras_shows_bidder_and_clarify_counts():
+    extras = extract_bid_extras({"numBidderTech": 5, "numClarifyReq": 2})
+    assert extras["Nhà thầu đã đăng ký"] == "5"
+    assert extras["Yêu cầu làm rõ"] == "2"
+
+
+def test_extract_bid_extras_tags_medicine_and_domestic():
+    extras = extract_bid_extras({"isMedicine": 1, "isDomestic": 1})
+    tag = extras.get("Tag", "")
+    assert "Gói thuốc" in tag
+    assert "Đấu thầu trong nước" in tag
+
+
+def test_extract_bid_extras_no_tag_when_neither_flag():
+    extras = extract_bid_extras({"isMedicine": 0, "isDomestic": 0})
+    assert "Tag" not in extras
+
+
+def test_extract_bid_extras_handles_invalid_counts_gracefully():
+    extras = extract_bid_extras({
+        "numBidderTech": "không phải số",
+        "numPetition": None,
+    })
+    # Không crash; không có entry
+    assert "Nhà thầu đã đăng ký" not in extras
+
+
 def test_extract_bid_extras_handles_non_dict():
     assert extract_bid_extras(None) == {}
     assert extract_bid_extras("not a dict") == {}
