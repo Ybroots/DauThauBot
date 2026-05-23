@@ -11,7 +11,7 @@ from .filter import match_bid
 from .formatter import format_bid_message
 from .models import Bid
 from .storage import init_db, load_groups_from_db, mark_seen, seed_groups_from_yaml, was_sent
-from .telegram import send_to_chats
+from .telegram import chitiet_button, send_to_chats
 
 _consecutive_empty = 0
 _consecutive_blocks = 0
@@ -157,7 +157,7 @@ def run_once() -> None:
 
             matched, kw, group_name = match_bid(bid, keywords_cfg)
             if not matched:
-                mark_seen(bid.tbmt_code, bid.title, sent=False)
+                mark_seen(bid.tbmt_code, bid.title, sent=False, bid=bid)
                 continue
 
             text = format_bid_message(bid, kw)
@@ -166,10 +166,11 @@ def run_once() -> None:
                 secrets.chat_id_list,
                 text,
                 sent_count=msg_batch,
+                reply_markup=chitiet_button(bid.tbmt_code),
             )
             msg_batch += len(secrets.chat_id_list)
 
-            mark_seen(bid.tbmt_code, bid.title, sent=(success_count > 0))
+            mark_seen(bid.tbmt_code, bid.title, sent=(success_count > 0), bid=bid)
             if success_count > 0:
                 sent_total += 1
                 logger.info(

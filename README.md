@@ -58,6 +58,8 @@ python -m tracker.bot_commands
 
 - `/tim` → bot gợi ý nhập từ khóa; tin tiếp theo (vd `camera, lâm đồng`) sẽ cào và gửi kết quả **ngay** trong chat đó (**không** ghi `seen.db`; khác luồng cron).
 - `/tim camera | máy chủ` — tra một lần với các từ OR.
+- `/chitiet <MÃ_TBMT>` — đọc chi tiết một gói thầu trên cổng và auto fill: chủ đầu tư, bên mời thầu, hình thức LCNT, phương thức, kế hoạch số, giá dự toán… Cũng chấp nhận paste URL chi tiết. Mỗi message bid (cron lẫn /tim) đều có nút **📄 Chi tiết** để bấm thay vì gõ mã.
+- Cron tự auto-fill `seen.db`: từ phiên bản này mỗi bid lưu kèm giá gói, hạn đóng thầu, chủ đầu tư, hình thức LCNT, phương thức, địa điểm — `/xem`, `/lichsu`, `/timhom`, `/chuagui` hiển thị compact (`GG: 500tr | HĐT: 31/12 15:00`) không phải cào lại cổng. DB cũ tự động migrate khi khởi động.
 - `/help` — hướng dẫn dài; `/lenh` — danh sách lệnh ngắn.
 - `/thongke` — thống kê 24h / 7d / 30d + tổng DB + chưa gửi; `/stats` — gói đã gửi 7 ngày.
 - `/lichsu [n]` — n tin gần nhất trong `seen.db` (mặc định 10); `/chuagui` — gói chưa gửi Telegram.

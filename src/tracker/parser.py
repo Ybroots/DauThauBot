@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .models import Bid
+
+# Mã TBMT chuẩn cổng: tiền tố chữ + số. notifyNo thường dạng "IB2500579539" hoặc số thuần.
+# notifyNoStand = notifyNo + "-" + version (vd. "-00"). Cho phép paste cả 2 dạng.
+_TBMT_CODE_RE = re.compile(r"\b([A-Z]{2,4}\d{6,14}|\d{8,14})(?:-(\d{1,3}))?\b", re.IGNORECASE)
 
 BASE_URL = "https://muasamcong.mpi.gov.vn"
 DETAIL_V2_BASE = (
@@ -21,6 +26,53 @@ INVEST_FIELD_NAMES: dict[str, str] = {
     "PTV": "Phi tư vấn",
     "HON_HOP": "Hỗn hợp",
 }
+
+PROCESS_APPLY_NAMES: dict[str, str] = {
+    "LDT": "Luật đấu thầu",
+    "NDT": "Nhà đầu tư",
+    "ODA": "ODA / vốn vay",
+}
+
+BID_MODE_NAMES: dict[str, str] = {
+    "1_MTHS": "Một giai đoạn một túi hồ sơ",
+    "1_MTHS_2_PT": "Một giai đoạn hai túi hồ sơ",
+    "2_MTHS": "Hai giai đoạn một túi hồ sơ",
+    "2_MTHS_2_PT": "Hai giai đoạn hai túi hồ sơ",
+}
+
+BID_FORM_NAMES: dict[str, str] = {
+    "DTRR": "Đấu thầu rộng rãi",
+    "DTHC": "Đấu thầu hạn chế",
+    "CDT": "Chỉ định thầu",
+    "CTH": "Chào hàng cạnh tranh",
+    "CHCT": "Chào hàng cạnh tranh",
+    "CHCT_RG": "Chào hàng cạnh tranh rút gọn",
+    "MSTT": "Mua sắm trực tiếp",
+    "TLBT": "Tự thực hiện",
+    "DBDT": "Đặc biệt",
+}
+
+STATUS_FOR_NOTIFY_NAMES: dict[str, str] = {
+    "DHTBMT": "Đã hủy TBMT",
+    "KCNTTT": "Không có nhà thầu trúng thầu",
+    "CNTTT": "Có nhà thầu trúng thầu",
+    "DHT": "Đã huỷ thầu",
+    "DHKQLCNT": "Đã huỷ KQLCNT",
+    "DXT": "Đang xét thầu",
+    "VHH": "Tuyên bố vô hiệu quyết định về KQLCNT",
+    "KCN": "Không công nhận KQLCNT",
+    "DC": "Đình chỉ cuộc thầu",
+}
+
+
+def _label(table: dict[str, str], code: object) -> str:
+    """Trả label nếu có trong table, không thì trả nguyên code (hoặc '')."""
+    if code is None:
+        return ""
+    s = str(code).strip()
+    if not s or s.lower() == "undefined":
+        return ""
+    return table.get(s, s)
 
 
 def _parse_dt(value: Any) -> datetime:
@@ -164,6 +216,75 @@ def parse_search_item(item: dict[str, Any], field_names: Optional[dict[str, str]
         description=_first_text(item.get("bidName")),
         raw=item,
     )
+
+
+def parse_tbmt_input(raw: str) -> tuple[str, Optional[str]]:
+    """Lấy (notifyNo, version) từ input của người dùng.
+
+    Hỗ trợ:
+    - "IB2500579539"                    → ("IB2500579539", None)
+    - "ib2500579539-00"                 → ("IB2500579539", "00")
+    - URL detail của cổng (đọc notifyNo) → ("IB2500579539", None hoặc version trong URL)
+
+    Trả ("", None) nếu không nhận diện được.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "", None
+
+    if "://" in s or s.lower().startswith("muasamcong"):
+        try:
+            url = s if "://" in s else f"https://{s}"
+            q = parse_qs(urlparse(url).query)
+            notify_no = (q.get("notifyNo") or [""])[0].strip().upper()
+            if notify_no:
+                version = (q.get("notifyVersion") or [""])[0].strip() or None
+                return notify_no, version
+        except (ValueError, TypeError):
+            pass
+
+    m = _TBMT_CODE_RE.search(s)
+    if m:
+        return m.group(1).upper(), (m.group(2) or None)
+    return "", None
+
+
+def extract_bid_extras(item: dict[str, Any]) -> dict[str, str]:
+    """Trả các trường detail bổ sung (decoded) chưa có trong dataclass Bid."""
+    if not isinstance(item, dict):
+        return {}
+    extras: dict[str, str] = {}
+
+    investor = (item.get("investorName") or "").strip()
+    procuring = (item.get("procuringEntityName") or "").strip()
+    if procuring and procuring != investor:
+        extras["Bên mời thầu"] = procuring
+
+    plan_no = (item.get("planNo") or "").strip()
+    if plan_no and plan_no.lower() != "undefined":
+        extras["Kế hoạch số"] = plan_no
+
+    bid_form = _label(BID_FORM_NAMES, item.get("bidForm"))
+    if bid_form:
+        extras["Hình thức LCNT"] = bid_form
+
+    bid_mode = _label(BID_MODE_NAMES, item.get("bidMode"))
+    if bid_mode:
+        extras["Phương thức"] = bid_mode
+
+    process = _label(PROCESS_APPLY_NAMES, item.get("processApply"))
+    if process:
+        extras["Luật áp dụng"] = process
+
+    estimate = item.get("bidEstimatePrice")
+    price = item.get("bidPrice")
+    try:
+        if estimate is not None and (price is None or int(estimate) != int(price)):
+            extras["Giá dự toán"] = f"{int(estimate):,} VNĐ"
+    except (TypeError, ValueError):
+        pass
+
+    return extras
 
 
 def parse_search_response(

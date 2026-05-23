@@ -11,7 +11,7 @@ import httpx
 from loguru import logger
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-from .parser import INVEST_FIELD_NAMES, parse_search_response
+from .parser import INVEST_FIELD_NAMES, parse_search_response, parse_search_item
 
 BASE_URL = "https://muasamcong.mpi.gov.vn"
 HOMEPAGE_PATH = "/web/guest/contractor-selection"
@@ -929,6 +929,71 @@ class MuasamcongCrawler:
             logger.info("fetch_recent_bids_multi: '{}' → {} bids", phrase, len(bids))
 
         return result
+
+    def fetch_bid_by_code(
+        self,
+        notify_no: str,
+        *,
+        version: Optional[str] = None,
+        include_closed: bool = True,
+    ):
+        """Tra một gói thầu theo mã notifyNo (kèm version tùy chọn).
+
+        Gọi smart/search với keyWord = notifyNo, chỉ matchFields=['notifyNo'] để chính xác.
+        Quét nhiều trang vì cổng đôi khi trả thêm version cũ. Trả về Bid khớp chính xác,
+        hoặc None nếu không tìm thấy. include_closed=True (mặc định) để vẫn tìm được
+        gói đã đóng thầu.
+        """
+        from .models import Bid
+
+        code = (notify_no or "").strip().upper()
+        if not code:
+            return None
+
+        ver = (version or "").strip()
+        target_stand = f"{code}-{ver}" if ver else None
+
+        payload_pages: list[Bid] = []
+        max_pages = 2
+
+        self._warmup_session()
+        self._load_field_names()
+
+        for page in range(max_pages):
+            payload = build_tbmt_keyword_payload(
+                page_number=page,
+                page_size=self.page_size,
+                keyword=code,
+                include_investor_fields=False,
+                open_only=not include_closed,
+            )
+            data = self._search(payload)
+            if isinstance(data, (int, float)):
+                raise BlockedException(429)
+            content = (data.get("page") or {}).get("content") or []
+            if not content:
+                break
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_no = (item.get("notifyNo") or "").strip().upper()
+                item_stand = (item.get("notifyNoStand") or "").strip().upper()
+                if target_stand and item_stand == target_stand:
+                    return parse_search_item(item, self._field_names)
+                if item_no == code:
+                    payload_pages.append(parse_search_item(item, self._field_names))
+
+            if len(content) < self.page_size:
+                break
+            if page < max_pages - 1:
+                self._human_delay(2.0, 5.0)
+
+        if not payload_pages:
+            return None
+        # Nhiều version → ưu tiên version cao nhất (mới nhất) để hiển thị bản hiện hành.
+        payload_pages.sort(key=lambda b: b.tbmt_code, reverse=True)
+        return payload_pages[0]
 
     def close(self) -> None:
         self.client.close()

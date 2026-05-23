@@ -14,7 +14,7 @@ from .crawler import MuasamcongCrawler
 from .filter import _build_haystack, normalize, match_bid
 from .models import Bid
 from .formatter import format_bid_message
-from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, send_message
+from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, chitiet_button, send_message
 
 # ── TTL in-memory result cache (5 min) ───────────────────────────────────────
 _CACHE_TTL_S = 300  # seconds
@@ -282,7 +282,7 @@ def run_interactive_keyword_search(
             if i > 0 and i % TELEGRAM_RATE_BATCH == 0:
                 time.sleep(TELEGRAM_BATCH_SLEEP_S)
             body = format_bid_message(bid, ks)
-            if send_message(token, cid, body):
+            if send_message(token, cid, body, reply_markup=chitiet_button(bid.tbmt_code)):
                 sent += 1
 
         # ── Tạo summary ───────────────────────────────────────────────────────

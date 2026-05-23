@@ -4,12 +4,33 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Optional
 
 from .config import PROJECT_ROOT, KeywordGroup, KeywordsConfig
 
 _dd = os.environ.get("DATA_DIR", "").strip()
 DATA_ROOT = Path(_dd) if _dd else (PROJECT_ROOT / "data")
 DB_PATH = DATA_ROOT / "seen.db"
+
+# Các cột extras thêm vào seen_bids — auto-fill khi crawl để /xem, /lichsu, /chuagui
+# hiển thị thông tin gói thầu mà không phải gọi lại API.
+_SEEN_EXTRA_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("budget_vnd", "INTEGER"),
+    ("closing_at", "TEXT"),
+    ("investor", "TEXT"),
+    ("bid_form", "TEXT"),
+    ("bid_mode", "TEXT"),
+    ("location", "TEXT"),
+)
+
+
+def _migrate_seen_bids_extras(conn: sqlite3.Connection) -> None:
+    """ALTER TABLE thêm cột extras nếu chưa có (idempotent)."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(seen_bids)").fetchall()}
+    for col, col_type in _SEEN_EXTRA_COLUMNS:
+        if col in existing:
+            continue
+        conn.execute(f"ALTER TABLE seen_bids ADD COLUMN {col} {col_type}")
 
 
 def init_db() -> None:
@@ -27,6 +48,7 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_at ON seen_bids(seen_at)")
+        _migrate_seen_bids_extras(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS keyword_groups (
@@ -68,14 +90,65 @@ def was_sent(tbmt_code: str) -> bool:
         return row is not None and row[0] == 1
 
 
-def mark_seen(tbmt_code: str, title: str, sent: bool = True) -> None:
+def _bid_extras_for_storage(bid: Any) -> dict[str, Any]:
+    """Trích extras để ghi vào seen_bids. Decode bidForm/bidMode bằng bảng nhãn parser."""
+    if bid is None:
+        return {col: None for col, _ in _SEEN_EXTRA_COLUMNS}
+
+    from .parser import BID_FORM_NAMES, BID_MODE_NAMES, _label
+
+    raw = getattr(bid, "raw", None) or {}
+    bid_form = _label(BID_FORM_NAMES, raw.get("bidForm")) or None
+    bid_mode = _label(BID_MODE_NAMES, raw.get("bidMode")) or None
+
+    closing = getattr(bid, "closing_at", None)
+    closing_iso: Optional[str] = None
+    if closing is not None:
+        try:
+            closing_iso = closing.isoformat()
+        except AttributeError:
+            closing_iso = str(closing)
+
+    return {
+        "budget_vnd": getattr(bid, "budget_vnd", None),
+        "closing_at": closing_iso,
+        "investor": getattr(bid, "investor", None) or None,
+        "bid_form": bid_form,
+        "bid_mode": bid_mode,
+        "location": getattr(bid, "location", None) or None,
+    }
+
+
+def mark_seen(
+    tbmt_code: str,
+    title: str,
+    sent: bool = True,
+    *,
+    bid: Any = None,
+) -> None:
+    """Ghi/cập nhật gói trong seen_bids. Truyền `bid` để lưu kèm extras."""
+    extras = _bid_extras_for_storage(bid)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO seen_bids(tbmt_code, title, seen_at, sent_to_telegram)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO seen_bids(
+                tbmt_code, title, seen_at, sent_to_telegram,
+                budget_vnd, closing_at, investor, bid_form, bid_mode, location
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (tbmt_code, title, datetime.now(timezone.utc).isoformat(), 1 if sent else 0),
+            (
+                tbmt_code,
+                title,
+                datetime.now(timezone.utc).isoformat(),
+                1 if sent else 0,
+                extras["budget_vnd"],
+                extras["closing_at"],
+                extras["investor"],
+                extras["bid_form"],
+                extras["bid_mode"],
+                extras["location"],
+            ),
         )
 
 
@@ -127,13 +200,26 @@ def count_unsent_in_db() -> int:
         return int(row[0]) if row else 0
 
 
-def list_recent_bids(limit: int = 10) -> list[tuple[str, str, str, int]]:
-    """tbmt_code, title, seen_at (ISO), sent_to_telegram — mới nhất trước."""
+def _row_to_extras(row: tuple) -> dict[str, Any]:
+    """Map 6 cột cuối (budget_vnd, closing_at, investor, bid_form, bid_mode, location)."""
+    return {
+        "budget_vnd": int(row[0]) if row[0] is not None else None,
+        "closing_at": str(row[1]) if row[1] is not None else None,
+        "investor": str(row[2]) if row[2] is not None else None,
+        "bid_form": str(row[3]) if row[3] is not None else None,
+        "bid_mode": str(row[4]) if row[4] is not None else None,
+        "location": str(row[5]) if row[5] is not None else None,
+    }
+
+
+def list_recent_bids(limit: int = 10) -> list[tuple[str, str, str, int, dict[str, Any]]]:
+    """(tbmt_code, title, seen_at, sent_to_telegram, extras) — mới nhất trước."""
     limit = max(1, min(int(limit), 50))
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
             """
-            SELECT tbmt_code, title, seen_at, sent_to_telegram
+            SELECT tbmt_code, title, seen_at, sent_to_telegram,
+                   budget_vnd, closing_at, investor, bid_form, bid_mode, location
             FROM seen_bids
             ORDER BY seen_at DESC
             LIMIT ?
@@ -141,18 +227,27 @@ def list_recent_bids(limit: int = 10) -> list[tuple[str, str, str, int]]:
             (limit,),
         )
         rows = cur.fetchall()
-    out: list[tuple[str, str, str, int]] = []
+    out: list[tuple[str, str, str, int, dict[str, Any]]] = []
     for r in rows:
-        out.append((str(r[0]), str(r[1] or ""), str(r[2]), int(r[3])))
+        out.append((str(r[0]), str(r[1] or ""), str(r[2]), int(r[3]), _row_to_extras(r[4:])))
     return out
 
 
-def list_unsent() -> list[tuple[str, str]]:
+def list_unsent() -> list[tuple[str, str, dict[str, Any]]]:
+    """(tbmt_code, title, extras) — chưa gửi Telegram."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
-            "SELECT tbmt_code, title FROM seen_bids WHERE sent_to_telegram = 0"
+            """
+            SELECT tbmt_code, title,
+                   budget_vnd, closing_at, investor, bid_form, bid_mode, location
+            FROM seen_bids
+            WHERE sent_to_telegram = 0
+            """
         )
-        return list(cur.fetchall())
+        return [
+            (str(r[0]), str(r[1] or ""), _row_to_extras(r[2:]))
+            for r in cur.fetchall()
+        ]
 
 
 def load_groups_from_db() -> KeywordsConfig:
@@ -263,16 +358,22 @@ def remove_keyword_from_group(group_name: str, keyword: str) -> bool:
 # ── Các hàm bổ sung ────────────────────────────────────────────────────────
 
 
-def lookup_bid_in_db(tbmt_code: str) -> tuple[str, str, int] | None:
-    """Tra mã TBMT trong seen.db. Trả về (title, seen_at, sent_to_telegram) hoặc None."""
+def lookup_bid_in_db(
+    tbmt_code: str,
+) -> tuple[str, str, int, dict[str, Any]] | None:
+    """Tra mã TBMT. Trả (title, seen_at, sent_to_telegram, extras) hoặc None."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT title, seen_at, sent_to_telegram FROM seen_bids WHERE tbmt_code = ?",
+            """
+            SELECT title, seen_at, sent_to_telegram,
+                   budget_vnd, closing_at, investor, bid_form, bid_mode, location
+            FROM seen_bids WHERE tbmt_code = ?
+            """,
             (tbmt_code.strip(),),
         ).fetchone()
         if row is None:
             return None
-        return (str(row[0] or ""), str(row[1]), int(row[2]))
+        return (str(row[0] or ""), str(row[1]), int(row[2]), _row_to_extras(row[3:]))
 
 
 def toggle_group_active(name: str, active: bool) -> bool:
@@ -307,8 +408,10 @@ def remove_bid_from_db(tbmt_code: str) -> bool:
         return cur.rowcount > 0
 
 
-def list_bids_since_hours(hours: int = 24) -> list[tuple[str, str, str, int]]:
-    """Gói đã thấy trong N giờ vừa qua (mới nhất trước, tối đa 50)."""
+def list_bids_since_hours(
+    hours: int = 24,
+) -> list[tuple[str, str, str, int, dict[str, Any]]]:
+    """(tbmt_code, title, seen_at, sent_to_telegram, extras) trong N giờ qua."""
     from datetime import timedelta
 
     hours = max(1, min(hours, 720))
@@ -316,7 +419,8 @@ def list_bids_since_hours(hours: int = 24) -> list[tuple[str, str, str, int]]:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
             """
-            SELECT tbmt_code, title, seen_at, sent_to_telegram
+            SELECT tbmt_code, title, seen_at, sent_to_telegram,
+                   budget_vnd, closing_at, investor, bid_form, bid_mode, location
             FROM seen_bids
             WHERE seen_at >= ?
             ORDER BY seen_at DESC
@@ -324,7 +428,10 @@ def list_bids_since_hours(hours: int = 24) -> list[tuple[str, str, str, int]]:
             """,
             (cutoff,),
         )
-        return [(str(r[0]), str(r[1] or ""), str(r[2]), int(r[3])) for r in cur.fetchall()]
+        return [
+            (str(r[0]), str(r[1] or ""), str(r[2]), int(r[3]), _row_to_extras(r[4:]))
+            for r in cur.fetchall()
+        ]
 
 
 def list_all_groups_raw() -> list[tuple[int, str, str, int, list[str]]]:

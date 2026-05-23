@@ -13,6 +13,7 @@ from tenacity import RetryError
 from .config import Secrets, load_keywords_yaml
 from .crawler import BlockedException, MuasamcongCrawler
 from .filter import explain_match, match_bid
+from .formatter import format_bid_detail
 from .interactive_search import parse_keyword_phrases, parse_search_query, run_interactive_keyword_search
 from .keyword_suggest import (
     build_suggest_reply,
@@ -20,6 +21,7 @@ from .keyword_suggest import (
     filter_bids_by_terms,
 )
 from .models import Bid
+from .parser import parse_tbmt_input
 from .storage import (
     add_group,
     add_keyword_to_group,
@@ -165,6 +167,45 @@ def _truncate(s: str, max_len: int) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 1] + "…"
+
+
+def _human_vnd(amount: int | None) -> str:
+    """100_000_000 → '100tr'; 1_500_000_000 → '1.5tỷ'; trả '' nếu None/0."""
+    if not amount:
+        return ""
+    a = int(amount)
+    if a >= 1_000_000_000:
+        return f"{a / 1_000_000_000:.1f}tỷ".replace(".0tỷ", "tỷ")
+    if a >= 1_000_000:
+        return f"{a / 1_000_000:.0f}tr"
+    return f"{a:,}"
+
+
+def _short_closing(closing_iso: str | None) -> str:
+    """ISO date → 'dd/mm HH:MM'. '' nếu không parse được."""
+    if not closing_iso:
+        return ""
+    s = str(closing_iso).replace("Z", "+00:00")
+    try:
+        from datetime import datetime as _dt
+        dt = _dt.fromisoformat(s)
+        return dt.strftime("%d/%m %H:%M")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _compact_extras(extras: dict) -> str:
+    """Một dòng phụ gọn: 'GG: 100tr | HĐT: 31/12 15:00' — bỏ phần thiếu, '' nếu rỗng."""
+    if not extras:
+        return ""
+    parts: list[str] = []
+    gg = _human_vnd(extras.get("budget_vnd"))
+    if gg:
+        parts.append(f"GG: {gg}")
+    hdt = _short_closing(extras.get("closing_at"))
+    if hdt:
+        parts.append(f"HĐT: {hdt}")
+    return " | ".join(parts)
 
 
 def _cmd_and_rest(text: str) -> tuple[str, str]:
@@ -476,6 +517,113 @@ def _execute_search(
         )
 
 
+def _execute_detail_fetch(
+    secrets: Secrets,
+    raw_input: str,
+    target_chat_id: str | int,
+    chat_scope_key: str,
+) -> None:
+    """/chitiet: tra một mã TBMT trên cổng, gửi message detail HTML."""
+    notify_no, version = parse_tbmt_input(raw_input)
+    token = secrets.telegram_bot_token
+    if not notify_no:
+        _reply(
+            token,
+            target_chat_id,
+            "Cú pháp: /chitiet MÃ_TBMT\n"
+            "Ví dụ:\n"
+            "  /chitiet IB2500579539\n"
+            "  /chitiet IB2500579539-00\n"
+            "  /chitiet <dán URL chi tiết của muasamcong>",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
+        )
+        return
+
+    cd_ok, secs = _cooldown_ok(secrets, chat_scope_key)
+    if not cd_ok:
+        _reply(
+            token,
+            target_chat_id,
+            f"Chờ thêm ~{secs}s rồi tra tiếp (tránh spam cào).",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
+        )
+        return
+
+    code_label = f"{notify_no}-{version}" if version else notify_no
+    _reply(
+        token,
+        target_chat_id,
+        f"Đang đọc chi tiết mã {code_label} trên Muasamcong (Playwright ~30–90s)…",
+    )
+
+    crawler = MuasamcongCrawler(
+        page_size=secrets.crawl_page_size,
+        use_playwright=secrets.use_playwright,
+        playwright_headless=secrets.playwright_headless,
+        playwright_channel=secrets.playwright_channel,
+    )
+    try:
+        bid = crawler.fetch_bid_by_code(notify_no, version=version, include_closed=True)
+    except BlockedException as e:
+        _reply(
+            token,
+            target_chat_id,
+            f"Cổng tạm chặn (HTTP {e.status_code}). Thử sau vài tiếng.",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
+        )
+        return
+    except RuntimeError as e:
+        msg = str(e)
+        if "reCAPTCHA" in msg or "invalid site key" in msg.lower():
+            _reply(token, target_chat_id, msg[:900],
+                   reply_markup=_kb([[_btn("🏠 Menu", "menu")]]))
+            return
+        logger.exception("/chitiet runtime")
+        _reply(token, target_chat_id, "Lỗi cào cổng. Xem logs/.",
+               reply_markup=_kb([[_btn("🏠 Menu", "menu")]]))
+        return
+    except RetryError:
+        logger.exception("/chitiet retry exhausted")
+        _reply(
+            token,
+            target_chat_id,
+            "Hết lần thử (thường do reCAPTCHA). Chạy lại sau ít phút, hoặc thử PLAYWRIGHT_HEADLESS=false.",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
+        )
+        return
+    except Exception:
+        logger.exception("/chitiet failed")
+        _reply(token, target_chat_id, "Lỗi khi cào cổng. Xem logs/.",
+               reply_markup=_kb([[_btn("🏠 Menu", "menu")]]))
+        return
+    finally:
+        crawler.close()
+
+    _mark_search_done(chat_scope_key)
+
+    if bid is None:
+        _reply(
+            token,
+            target_chat_id,
+            f'Không tìm thấy gói "{code_label}" trên cổng.\n'
+            "Kiểm tra lại mã, hoặc gói có thể đã bị huỷ TBMT.",
+            reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
+        )
+        return
+
+    body = format_bid_detail(bid)
+    _reply(
+        token,
+        target_chat_id,
+        body,
+        parse_html=True,
+        reply_markup=_kb([
+            [_btn("🔍 Tìm thêm", "search|open"), _btn("🌐 Tìm cả đóng", "search|closed")],
+            [_btn("🏠 Menu", "menu")],
+        ]),
+    )
+
+
 def HELP_VI() -> str:
     return (
         "Luồng cron: tracker trên máy + keyword groups trong DB.\n\n"
@@ -515,6 +663,7 @@ def HELP_VI() -> str:
         "• /timgroup Tên — tìm kiếm ngay theo từ khóa của group\n"
         "• /testkw từ khóa thử — debug group nào match\n\n"
         "Quản lý dữ liệu:\n"
+        "• /chitiet MÃ — đọc chi tiết gói trên cổng (auto fill data)\n"
         "• /xem MÃ — tra mã TBMT trong DB (tiêu đề, đã gửi chưa)\n"
         "• /timhom [hours] — gói thấy trong N giờ qua (mặc định 24h)\n"
         "• /xoa MÃ — admin: xóa mã khỏi DB để cron gửi lại\n\n"
@@ -539,6 +688,7 @@ def COMMAND_LIST_VI() -> str:
         "• /batgroup Tên — bật lại group\n"
         "• /testkw từ khóa — debug group nào match\n"
         "\nDữ liệu:\n"
+        "• /chitiet MÃ — đọc chi tiết gói trên cổng (auto fill)\n"
         "• /xem MÃ_TBMT — tra mã trong DB\n"
         "• /timhom [hours] — gói thấy trong N giờ (mặc định 24h)\n"
         "• /xoa MÃ — admin: xóa khỏi DB để cron gửi lại\n"
@@ -741,10 +891,9 @@ def handle_slash(
                 f'Không tìm thấy mã "{code}" trong DB.\n'
                 "Bot chỉ lưu gói đã qua cron hoặc /tim. Thử /timtat để tìm trên cổng."
             )
-        title, seen_at, sent = row
+        title, seen_at, sent, extras = row
         flag = "Đã gửi Telegram" if sent else "Chưa gửi Telegram"
         short_at = seen_at[:19].replace("T", " ") if len(seen_at) >= 19 else seen_at
-        # Construct a minimal detail page link — search portal by notifyNo
         notify_no = code.rsplit("-", 1)[0] if "-" in code else code
         search_link = (
             "https://muasamcong.mpi.gov.vn/web/guest/contractor-selection"
@@ -752,13 +901,36 @@ def handle_slash(
             "&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view"
             "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=index"
         )
-        return (
+
+        extras_lines: list[str] = []
+        if extras.get("investor"):
+            extras_lines.append(f"<b>Chủ đầu tư:</b> {html.escape(extras['investor'])}")
+        if extras.get("location"):
+            extras_lines.append(f"<b>Địa điểm:</b> {html.escape(extras['location'])}")
+        gg = _human_vnd(extras.get("budget_vnd"))
+        if gg:
+            extras_lines.append(f"<b>Giá gói:</b> {gg} (~{extras['budget_vnd']:,} VNĐ)")
+        hdt = _short_closing(extras.get("closing_at"))
+        if hdt:
+            extras_lines.append(f"<b>Đóng thầu:</b> {hdt}")
+        if extras.get("bid_form"):
+            extras_lines.append(f"<b>Hình thức LCNT:</b> {html.escape(extras['bid_form'])}")
+        if extras.get("bid_mode"):
+            extras_lines.append(f"<b>Phương thức:</b> {html.escape(extras['bid_mode'])}")
+
+        head = (
             f"<b>Mã TBMT:</b> <code>{html.escape(code)}</code>\n"
             f"<b>Tiêu đề:</b> {html.escape(title)}\n"
             f"<b>Trạng thái gửi:</b> {flag}\n"
-            f"<b>Thấy lúc:</b> {short_at} UTC\n"
-            f'\n🔗 <a href="{search_link}">Tìm trên muasamcong</a> (tìm mã <code>{html.escape(notify_no)}</code>)'
+            f"<b>Thấy lúc:</b> {short_at} UTC"
         )
+        body = ("\n" + "\n".join(extras_lines)) if extras_lines else ""
+        footer = (
+            f'\n\n🔗 <a href="{search_link}">Tìm trên muasamcong</a> '
+            f"(tìm mã <code>{html.escape(notify_no)}</code>)\n"
+            "Gõ /chitiet để đọc đầy đủ từ cổng."
+        )
+        return head + body + footer
 
     if cmd in ("/renamegroup",):
         if not _is_privileged(secrets, chat_id=chat_id, user_id=user_id):
@@ -808,10 +980,14 @@ def handle_slash(
             h_label = f"{hours}h" if hours != 24 else "24h"
             return f"Không thấy gói nào trong {h_label} vừa qua."
         lines = []
-        for code, title, seen_at, sent in rows:
+        for code, title, seen_at, sent, extras in rows:
             flag = "gửi" if sent else "chưa"
             short_time = seen_at[11:16] if len(seen_at) >= 16 else seen_at
-            lines.append(f"• [{flag}] {code} — {_truncate(title, 58)}\n  {short_time} UTC")
+            extras_line = _compact_extras(extras)
+            tail = f"\n  {short_time} UTC"
+            if extras_line:
+                tail += f"  ·  {extras_line}"
+            lines.append(f"• [{flag}] {code} — {_truncate(title, 58)}{tail}")
         h_label = f"{hours}h" if hours != 24 else "24h"
         return f"Gói thấy trong {h_label} ({len(rows)} gói):\n" + "\n".join(lines)
 
@@ -856,10 +1032,14 @@ def handle_slash(
         if not rows:
             return "Chưa có dữ liệu trong DB (chạy tracker hoặc /test)."
         lines = []
-        for code, title, seen_at, sent in rows:
+        for code, title, seen_at, sent, extras in rows:
             flag = "đã gửi" if sent else "chưa gửi"
             short_at = seen_at[:19].replace("T", " ") if len(seen_at) >= 19 else seen_at
-            lines.append(f"• [{flag}] {code} — {_truncate(title, 72)}\n  {short_at} UTC")
+            extras_line = _compact_extras(extras)
+            tail = f"\n  {short_at} UTC"
+            if extras_line:
+                tail += f"  ·  {extras_line}"
+            lines.append(f"• [{flag}] {code} — {_truncate(title, 72)}{tail}")
         return f"{len(rows)} tin gần nhất:\n" + "\n".join(lines)
 
     if cmd in ("/chuagui", "/unsent"):
@@ -868,7 +1048,11 @@ def handle_slash(
         if not rows:
             return "Không có gói chưa gửi (sent_to_telegram=0)."
         cap = 15
-        lines = [f"• {c} — {_truncate(t, 80)}" for c, t in rows[:cap]]
+        lines: list[str] = []
+        for c, t, extras in rows[:cap]:
+            extras_line = _compact_extras(extras)
+            tail = f"  ·  {extras_line}" if extras_line else ""
+            lines.append(f"• {c} — {_truncate(t, 80)}{tail}")
         more = f"\n… và {len(rows) - cap} gói nữa." if len(rows) > cap else ""
         return f"Chưa gửi Telegram ({len(rows)} gói):\n" + "\n".join(lines) + more
 
@@ -1028,6 +1212,10 @@ def process_message(secrets: Secrets, msg: dict) -> None:
             return
         _await_keyword.pop(ukey, None)
         _execute_search(secrets, phrases, chat_id, cid_s, mode=search_mode, include_closed=True)
+        return
+
+    if cmd in ("/chitiet", "/detail"):
+        _execute_detail_fetch(secrets, rest, chat_id, cid_s)
         return
 
     if cmd in ("/timgroup",):
@@ -1616,6 +1804,15 @@ def process_callback_query(secrets: Secrets, cq: dict) -> None:
         _filter_state.pop(ukey, None)
         _await_group_action.pop(ukey, None)
         _reply(token, chat_id, "Đã hủy.", reply_markup=_main_menu_kb())
+        return
+
+    # ── ct|<mã TBMT> — đọc chi tiết từ nút trên message bid ───────────────
+    if data.startswith("ct|"):
+        code = data[3:].strip()
+        if not code:
+            _reply(token, chat_id, "Nút Chi tiết không có mã.")
+            return
+        _execute_detail_fetch(secrets, code, chat_id, cid_s)
         return
 
     # ── hint|addgroup ─────────────────────────────────────────────────────
