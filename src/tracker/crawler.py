@@ -580,9 +580,14 @@ class MuasamcongCrawler:
         return token
 
     def _pw_launch_browser(self, p: Any) -> Any:
-        """Launch Chromium với các flag chống detect automation."""
+        """Launch Chromium với các flag chống detect automation.
+
+        Timeout 20s để fail fast nếu OS không spawn được subprocess
+        (đã từng hang 8h khi không có timeout — Railway resource exhaustion).
+        """
         launch_kw: dict[str, Any] = {
             "headless": self.playwright_headless,
+            "timeout": 20_000,  # 20s — không để mãi
             "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
@@ -591,7 +596,11 @@ class MuasamcongCrawler:
         }
         if self.playwright_channel:
             launch_kw["channel"] = self.playwright_channel
-        browser = p.chromium.launch(**launch_kw)
+        try:
+            browser = p.chromium.launch(**launch_kw)
+        except Exception as e:
+            logger.error("Playwright launch FAILED ({}): {}", type(e).__name__, str(e)[:200])
+            raise
         logger.info(
             "Playwright: Chromium headless={} channel={}",
             self.playwright_headless,
@@ -631,7 +640,7 @@ class MuasamcongCrawler:
                 pass
             _, page = self._pw_new_page(context)
 
-        page.goto(INDEX_URL, wait_until="load", timeout=120000)
+        page.goto(INDEX_URL, wait_until="load", timeout=60_000)
         logger.info("Playwright: đã tải xong trang index cổng")
         self._pw_stabilize(page, nav_try)
 
@@ -678,7 +687,7 @@ class MuasamcongCrawler:
                                 url,
                                 headers=headers,
                                 data=json.dumps(payload),
-                                timeout=120000,
+                                timeout=60_000,
                             )
                             if resp.status in (429, 403):
                                 raise BlockedException(resp.status)
@@ -796,7 +805,7 @@ class MuasamcongCrawler:
                                     url,
                                     headers=headers,
                                     data=json.dumps(payload),
-                                    timeout=120000,
+                                    timeout=60_000,
                                 )
                                 if resp.status in (429, 403):
                                     raise BlockedException(resp.status)

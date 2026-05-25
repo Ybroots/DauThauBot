@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import threading
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
@@ -11,6 +13,11 @@ from loguru import logger
 from .__main__ import _maybe_alert_block, _setup_logging, run_once
 from .config import Secrets
 from .crawler import BlockedException
+
+# Hard limit: nếu safe_run() chạy quá ngưỡng này → force exit để Railway restart.
+# Cron interval mặc định 45m, mỗi từ khóa Playwright + reCAPTCHA ~30–90s,
+# 8 từ × 5 trang ≈ 6–12 phút. 8 phút là buffer hợp lý — quá là chắc chắn hang.
+WATCHDOG_SECONDS = 480  # 8 phút
 _block_state: dict = {
     "blocked_until": None,
     "consecutive_blocks": 0,
@@ -60,6 +67,21 @@ def _trigger_cooldown(secrets: Secrets) -> float:
     return hours
 
 
+def _watchdog_fire() -> None:
+    """Watchdog callback: nếu safe_run kẹt > WATCHDOG_SECONDS → kill process.
+
+    Đã từng có sự cố 8 tiếng cron skip vì Playwright launch hang vô thời hạn.
+    os._exit(2) bỏ qua atexit hooks; Railway restartPolicy ON_FAILURE sẽ
+    respawn container trong ~30s. Telegram bot bị restart theo (tradeoff
+    chấp nhận: thà mất 1 message giữa chừng còn hơn zombie 8 giờ).
+    """
+    logger.error(
+        "WATCHDOG FIRED: safe_run exceeded {}s — forcing exit(2) so Railway restarts the service",
+        WATCHDOG_SECONDS,
+    )
+    os._exit(2)
+
+
 def safe_run() -> None:
     secrets = Secrets()
     now = datetime.now(TZ)
@@ -77,6 +99,9 @@ def safe_run() -> None:
         logger.info("Skip run: in block cooldown until {}", until.isoformat() if until else "?")
         return
 
+    watchdog = threading.Timer(WATCHDOG_SECONDS, _watchdog_fire)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         run_once()
         _block_state["consecutive_blocks"] = 0
@@ -85,6 +110,8 @@ def safe_run() -> None:
         _trigger_cooldown(secrets)
     except Exception:
         logger.exception("Unhandled error in run_once, but scheduler continues")
+    finally:
+        watchdog.cancel()
 
 
 def main(secrets: Optional[Secrets] = None, *, skip_setup_logging: bool = False) -> None:
