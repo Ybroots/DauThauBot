@@ -15,6 +15,11 @@ from .filter import _build_haystack, normalize, match_bid
 from .models import Bid
 from .formatter import format_bid_message
 from .telegram import TELEGRAM_BATCH_SLEEP_S, TELEGRAM_RATE_BATCH, chitiet_button, send_message
+from .tender_store import (
+    get_last_crawl_time,
+    search_tenders,
+    upsert_tenders_bulk,
+)
 
 # ── TTL in-memory result cache (5 min) ───────────────────────────────────────
 _CACHE_TTL_S = 300  # seconds
@@ -89,6 +94,71 @@ def parse_search_query(raw: str) -> tuple[list[str], str]:
     return parse_keyword_phrases(raw), "any"
 
 
+def _freshness_note() -> str:
+    """Trả chuỗi 'X phút/giờ trước' từ lần cron cập nhật tenders gần nhất."""
+    try:
+        last = get_last_crawl_time()
+        if not last:
+            return ""
+        from datetime import datetime, timezone
+        delta = datetime.now(timezone.utc) - last
+        mins = int(delta.total_seconds() / 60)
+        if mins < 2:
+            return "vừa xong"
+        if mins < 60:
+            return f"{mins} phút trước"
+        hrs = mins // 60
+        return f"{hrs} giờ trước"
+    except Exception:
+        return ""
+
+
+def _emit_bids_to_chat(
+    bids: list[Bid],
+    phrases: list[str],
+    token: str,
+    cid: str,
+    cap: int,
+    *,
+    require: str = "any",
+    strict: bool = True,
+) -> tuple[int, int, list[Bid]]:
+    """Filter + sort + gửi bids → Telegram.
+
+    Returns (sent, total_matched, matched_bid_list).
+    """
+    from .config import KeywordGroup, KeywordsConfig
+
+    if phrases:
+        cfg = KeywordsConfig(
+            groups=[KeywordGroup(name="Search", require=require, keywords=phrases)]
+        )
+        matched: list[tuple] = []
+        for bid in bids:
+            ok, ks, _ = match_bid(bid, cfg, strict_keywords=strict)
+            if ok:
+                matched.append((bid, ks))
+        if len(matched) > 1 and len(phrases) > 1:
+            matched.sort(
+                key=lambda t: _relevance_score(t[0], phrases, strict),
+                reverse=True,
+            )
+    else:
+        matched = [(b, []) for b in bids]
+
+    total = len(matched)
+    to_emit = matched[:cap]
+    sent = 0
+    for i, (bid, ks) in enumerate(to_emit):
+        if i > 0 and i % TELEGRAM_RATE_BATCH == 0:
+            time.sleep(TELEGRAM_BATCH_SLEEP_S)
+        body = format_bid_message(bid, ks)
+        if send_message(token, cid, body, reply_markup=chitiet_button(bid.tbmt_code)):
+            sent += 1
+    matched_bids = [t[0] for t in matched]
+    return sent, total, matched_bids
+
+
 def _relevance_score(bid: Bid, phrases: list[str], strict: bool) -> tuple[int, int]:
     """Returns (matched_phrase_count, title_match_count) for relevance sorting (higher = better)."""
     haystack = _build_haystack(bid)
@@ -132,7 +202,60 @@ def run_interactive_keyword_search(
     """
     require: str = mode if mode in ("all", "any") else "any"
     cap = secrets.interactive_search_max_messages
+    token = secrets.telegram_bot_token
+    cid = str(target_chat_id)
 
+    uniq_early: list[str] = list(dict.fromkeys(p.strip() for p in phrases if p.strip()))
+
+    # ── DB-FIRST: tìm trong catalog tenders (không cần Playwright) ───────────
+    db_enabled = getattr(secrets, "db_search_enabled", True)
+    tender_limit = getattr(secrets, "tender_search_limit", 10)
+
+    if db_enabled and uniq_early and not field_filter and bid_method_filter is None:
+        try:
+            db_bids = search_tenders(
+                uniq_early,
+                mode=require,
+                open_only=not include_closed,
+                limit=max(cap, tender_limit),
+            )
+            if db_bids:
+                freshness = _freshness_note()
+                fresh_tag = f" ⚡ kho dữ liệu ({freshness})" if freshness else " ⚡ kho dữ liệu"
+                logger.info(
+                    "db_search hit: {} bids for phrases={} mode={}",
+                    len(db_bids), uniq_early, require,
+                )
+                sent, total, matched_bids = _emit_bids_to_chat(
+                    db_bids, uniq_early, token, cid, cap,
+                    require=require,
+                    strict=getattr(secrets, "interactive_search_strict_keywords", True),
+                )
+                mode_label = "AND" if require == "all" else "OR"
+                closed_note = " (kể cả đã đóng)" if include_closed else ""
+                if total == 0:
+                    summary = (
+                        f"Không tìm thấy kết quả [{mode_label}]{closed_note} trong kho dữ liệu.\n"
+                        "Bot đang tự động tìm trực tiếp trên cổng…"
+                    )
+                    # Không có gì từ DB sau filter → fall through to live crawl
+                    logger.info("db_search: {} bids loaded but 0 matched after filter — live crawl fallback", len(db_bids))
+                else:
+                    if total > sent:
+                        summary = (
+                            f"Tìm thấy {total} gói [{mode_label}]{closed_note}{fresh_tag}. "
+                            f"Đã gửi {sent} tin (giới hạn {cap}/lần)."
+                        )
+                    else:
+                        summary = (
+                            f"Tìm thấy {total} gói [{mode_label}]{closed_note}{fresh_tag}. "
+                            f"Đã gửi {sent} tin."
+                        )
+                    return sent, total, summary, matched_bids
+        except Exception:
+            logger.exception("db_search path failed — falling through to live crawl")
+
+    # ── LIVE CRAWL (Playwright) — khi DB không có kết quả hoặc disabled ──────
     crawler = MuasamcongCrawler(
         page_size=secrets.crawl_page_size,
         use_playwright=secrets.use_playwright,
@@ -141,8 +264,6 @@ def run_interactive_keyword_search(
     )
     matched: list[tuple] = []
     sent = 0
-    token = secrets.telegram_bot_token
-    cid = str(target_chat_id)
 
     try:
         uniq: list[str] = []
@@ -364,6 +485,16 @@ def run_interactive_keyword_search(
                     )
 
         matched_bids = [t[0] for t in matched]
+
+        # ── Lưu kết quả live crawl vào tenders catalog cho lần sau ───────────
+        if bids:
+            try:
+                kw_map = {b.tbmt_code: uniq for b in bids}
+                upsert_tenders_bulk(bids, keywords_matched_map=kw_map)
+                logger.info("tenders catalog: upserted {} live crawl bids", len(bids))
+            except Exception:
+                logger.exception("upsert_tenders_bulk (interactive) failed")
+
         return sent, total, summary, matched_bids
     finally:
         crawler.close()

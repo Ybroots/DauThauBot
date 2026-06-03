@@ -12,6 +12,11 @@ from .formatter import format_bid_message
 from .models import Bid
 from .storage import init_db, load_groups_from_db, mark_seen, seed_groups_from_yaml, was_sent
 from .telegram import chitiet_button, send_to_chats
+from .tender_store import (
+    log_crawl_finish,
+    log_crawl_start,
+    upsert_tenders_bulk,
+)
 
 _consecutive_empty = 0
 _consecutive_blocks = 0
@@ -123,6 +128,9 @@ def run_once() -> None:
     seed_groups_from_yaml(load_keywords_yaml())
     keywords_cfg = load_groups_from_db()
 
+    kw_strings = _tracker_keyword_strings(keywords_cfg)
+    log_id = log_crawl_start("cron", keywords=kw_strings)
+
     crawler = MuasamcongCrawler(
         page_size=secrets.crawl_page_size,
         use_playwright=secrets.use_playwright,
@@ -130,6 +138,10 @@ def run_once() -> None:
         playwright_channel=secrets.playwright_channel,
     )
     sent_total = 0
+    total_new = total_updated = total_failed = 0
+    crawl_status = "success"
+    error_msg: str | None = None
+
     try:
         logger.info(
             "fetch_start page_size={} crawl_max_pages={} (~{} kết quả mỗi nguồn)",
@@ -147,8 +159,25 @@ def run_once() -> None:
                 logger.warning(warn)
                 if secrets.admin_chat_id:
                     send_to_chats(secrets.telegram_bot_token, [secrets.admin_chat_id], warn)
+            crawl_status = "partial_failed" if _consecutive_empty >= 3 else "success"
         else:
             _consecutive_empty = 0
+
+        # ── Upsert TẤT CẢ bid vào catalog tenders (DB-first search cho /tim) ──
+        try:
+            # Build keywords_matched map: bid → danh sách kw matched
+            kw_map: dict[str, list[str]] = {}
+            for bid in bids:
+                matched_check, kw, _ = match_bid(bid, keywords_cfg)
+                if matched_check:
+                    kw_map[bid.tbmt_code] = kw
+            total_new, total_updated = upsert_tenders_bulk(bids, keywords_matched_map=kw_map)
+            logger.info(
+                "tenders catalog: {} new, {} updated (total {} bids)",
+                total_new, total_updated, len(bids),
+            )
+        except Exception:
+            logger.exception("upsert_tenders_bulk failed — continuing")
 
         msg_batch = 0
         for bid in bids:
@@ -161,15 +190,20 @@ def run_once() -> None:
                 continue
 
             text = format_bid_message(bid, kw)
-            success_count = send_to_chats(
-                secrets.telegram_bot_token,
-                secrets.chat_id_list,
-                text,
-                sent_count=msg_batch,
-                reply_markup=chitiet_button(bid.tbmt_code),
-            )
-            msg_batch += len(secrets.chat_id_list)
+            try:
+                success_count = send_to_chats(
+                    secrets.telegram_bot_token,
+                    secrets.chat_id_list,
+                    text,
+                    sent_count=msg_batch,
+                    reply_markup=chitiet_button(bid.tbmt_code),
+                )
+            except Exception:
+                logger.exception("send_to_chats failed for {}", bid.tbmt_code)
+                total_failed += 1
+                success_count = 0
 
+            msg_batch += len(secrets.chat_id_list)
             mark_seen(bid.tbmt_code, bid.title, sent=(success_count > 0), bid=bid)
             if success_count > 0:
                 sent_total += 1
@@ -180,13 +214,31 @@ def run_once() -> None:
                     kw,
                 )
 
+        if total_failed > 0:
+            crawl_status = "partial_failed"
         logger.info("Done. New bids sent: {}", sent_total)
         _consecutive_blocks = 0
-    except BlockedException:
+    except BlockedException as e:
         _consecutive_blocks += 1
+        crawl_status = "failed"
+        error_msg = f"BlockedException HTTP {e.status_code}"
+        raise
+    except Exception as e:
+        crawl_status = "failed"
+        error_msg = str(e)[:500]
         raise
     finally:
         crawler.close()
+        log_crawl_finish(
+            log_id,
+            status=crawl_status,
+            total_found=len(bids) if "bids" in dir() else 0,  # type: ignore[name-defined]
+            total_new=total_new,
+            total_updated=total_updated,
+            total_sent=sent_total,
+            total_failed=total_failed,
+            error_message=error_msg,
+        )
 
 
 def main() -> None:

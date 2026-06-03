@@ -47,6 +47,11 @@ from .storage import (
     toggle_group_active,
     total_bids_in_db,
 )
+from .tender_store import (
+    count_tenders,
+    get_last_crawl_time,
+    list_crawl_logs,
+)
 from .__main__ import run_once
 
 BOT_VERSION = "0.1.0"
@@ -850,6 +855,7 @@ def COMMAND_LIST_VI() -> str:
         "• /timhom [hours] — gói thấy trong N giờ (mặc định 24h)\n"
         "• /xoa MÃ — admin: xóa khỏi DB để cron gửi lại\n"
         "• /thongke /lichsu [n] /chuagui /stats\n"
+        "• /crawllogs [n] — n lần cào gần nhất (mặc định 5)\n"
         "\nKhác: /id /ping /about /test /help /hủy"
     )
 
@@ -1178,12 +1184,33 @@ def handle_slash(
             f"(headless={'on' if secrets.playwright_headless else 'off'})",
         ]
 
-        # Section 3: Stats
+        # Section 3: Stats + Catalog
+        try:
+            tender_total = count_tenders()
+            tender_open = count_tenders(open_only=True)
+            last_crawl = get_last_crawl_time()
+            if last_crawl:
+                from datetime import datetime as _dt2, timezone as _tz2
+                delta_min = int((_dt2.now(_tz2.utc) - last_crawl).total_seconds() / 60)
+                if delta_min < 60:
+                    last_crawl_str = f"{delta_min} phút trước"
+                else:
+                    last_crawl_str = f"{delta_min // 60}h{delta_min % 60:02d}m trước"
+            else:
+                last_crawl_str = "Chưa có dữ liệu"
+        except Exception:
+            tender_total = tender_open = 0
+            last_crawl_str = "?"
+
+        db_mode = "bật ⚡" if getattr(secrets, "db_search_enabled", True) else "tắt"
         lines += [
             "",
             "<b>3. Hoạt động</b>",
             f"  • Đã gửi 24h: <b>{h24}</b> | 7 ngày: {d7}",
-            f"  • Tổng trong DB: {tot_db} (chưa gửi: {unsent_db})",
+            f"  • seen.db: {tot_db} gói (chưa gửi: {unsent_db})",
+            f"  • Catalog tenders: <b>{tender_total}</b> gói ({tender_open} đang mở)",
+            f"  • Cập nhật catalog lần cuối: {last_crawl_str}",
+            f"  • DB-search (/tim): {db_mode}",
             f"  • Bây giờ (UTC): {utc_now}",
         ]
 
@@ -1194,8 +1221,40 @@ def handle_slash(
             "  /tatallgroup — tạm tắt tất cả (cron rảnh)",
             "  /batallgroup — bật lại tất cả",
             "  /huyhetgroup — xóa hết group (reset, cần confirm)",
+            "  /crawllogs — lịch sử crawl gần nhất",
             "  /addgroup, /addkw — thêm group/từ khóa",
         ]
+        return "\n".join(lines)
+
+    if cmd in ("/crawllogs", "/lshcrawl"):
+        init_db()
+        n = _parse_positive_int(rest, default=5, max_v=20)
+        logs = list_crawl_logs(n)
+        if not logs:
+            return "Chưa có log cào nào. Chạy /test hoặc đợi cron tiếp theo."
+        lines = [f"📋 <b>{n} lần cào gần nhất</b>"]
+        for lg in logs:
+            started = (lg.get("started_at") or "")[:16].replace("T", " ")
+            dur = lg.get("duration_ms")
+            dur_s = f"{dur/1000:.0f}s" if dur else "?"
+            status = lg.get("status") or "?"
+            status_icon = "✅" if status == "success" else ("⚠️" if status == "partial_failed" else "❌")
+            found = lg.get("total_found", 0)
+            new_ = lg.get("total_new", 0)
+            sent_ = lg.get("total_sent", 0)
+            job = lg.get("job_type", "cron")
+            kws = lg.get("keywords") or ""
+            kw_short = (kws[:40] + "…") if len(kws) > 40 else kws
+            line = (
+                f"{status_icon} <code>{started}</code> [{job}] {dur_s}\n"
+                f"   found={found} new={new_} sent={sent_}"
+            )
+            if kw_short:
+                line += f"\n   kw: {html.escape(kw_short)}"
+            err = lg.get("error_message")
+            if err:
+                line += f"\n   ⚠ {html.escape(str(err)[:80])}"
+            lines.append(line)
         return "\n".join(lines)
 
     if cmd in ("/tatallgroup", "/disableall"):
@@ -1546,7 +1605,7 @@ def process_message(secrets: Secrets, msg: dict) -> None:
         user_id=int(uid),
     )
     if routed:
-        parse_html_cmds = ("/id", "/ma", "/xem", "/lookup", "/trangthai", "/status")
+        parse_html_cmds = ("/id", "/ma", "/xem", "/lookup", "/trangthai", "/status", "/crawllogs", "/lshcrawl")
         kb: Optional[dict] = None
         _groups_cmds = (
             "/groups", "/keywords",

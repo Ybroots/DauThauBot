@@ -104,6 +104,13 @@ class Secrets(BaseSettings):
     # true: trong nhóm, gửi một dòng gợi ý /tim khi không khớp lệnh
     bot_group_reply_hint: bool = False
 
+    # ── Tender catalog search ─────────────────────────────────────────────────
+    # true: /tim tìm DB trước (catalog tenders), Playwright là fallback khi không có kết quả.
+    # false: luôn crawl trực tiếp (hành vi cũ).
+    db_search_enabled: bool = True
+    # Số kết quả tối đa trả về từ DB search (không ảnh hưởng live crawl cap).
+    tender_search_limit: int = 10
+
     @property
     def interactive_fetch_max_pages(self) -> int:
         """Số trang smart/search cho mỗi cụm từ trong /tim."""

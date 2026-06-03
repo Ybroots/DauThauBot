@@ -72,6 +72,13 @@ def init_db() -> None:
             """
         )
 
+    # Tạo bảng tenders + crawl_logs — gọi sau with block để tránh conflict lock
+    try:
+        from .tender_store import init_tender_tables
+        init_tender_tables()
+    except Exception:
+        pass  # Không để lỗi này crash init_db
+
 
 def is_seen(tbmt_code: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
