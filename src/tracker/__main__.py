@@ -139,6 +139,7 @@ def run_once() -> None:
     )
     sent_total = 0
     total_new = total_updated = total_failed = 0
+    _total_found = 0  # pre-init để finally block không bị NameError
     crawl_status = "success"
     error_msg: str | None = None
 
@@ -150,7 +151,8 @@ def run_once() -> None:
             secrets.crawl_max_bids,
         )
         bids = _collect_bids_crawl(crawler, secrets, keywords_cfg)
-        logger.info("Fetched {} bids (sau gộp)", len(bids))
+        _total_found = len(bids)
+        logger.info("Fetched {} bids (sau gộp)", _total_found)
 
         if len(bids) == 0:
             _consecutive_empty += 1
@@ -232,7 +234,7 @@ def run_once() -> None:
         log_crawl_finish(
             log_id,
             status=crawl_status,
-            total_found=len(bids) if "bids" in dir() else 0,  # type: ignore[name-defined]
+            total_found=_total_found,
             total_new=total_new,
             total_updated=total_updated,
             total_sent=sent_total,

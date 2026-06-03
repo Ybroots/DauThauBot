@@ -257,23 +257,39 @@ class MuasamcongCrawler:
         self._last_request_at = time.time()
 
     def _warmup_session(self) -> None:
+        """GET homepage để lấy cookies trước Playwright.
+
+        Non-fatal: nếu HTTP warmup lỗi (timeout, 404, network) thì log WARNING
+        và tiếp tục — Playwright sẽ tự navigate trang chủ khi cần.
+        Đặc biệt quan trọng khi Railway IP bị throttle hoặc cổng bảo trì ngắn.
+        """
         if self._session_warmed:
             return
         logger.debug("Warming up session (GET homepage)...")
-        r = self.client.get(
-            HOMEPAGE_PATH,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-            },
-        )
-        r.raise_for_status()
-        self._human_delay(3.0, 8.0)
-        self._session_warmed = True
-        logger.debug("Session warmed up, cookies: {}", len(self.client.cookies))
+        try:
+            r = self.client.get(
+                HOMEPAGE_PATH,
+                timeout=15.0,  # Short — fail fast, Playwright takes over
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                },
+            )
+            r.raise_for_status()
+            self._human_delay(2.0, 5.0)
+            logger.debug("Session warmed up, cookies: {}", len(self.client.cookies))
+        except Exception as e:
+            # Không để warmup crash toàn bộ crawl — Playwright vẫn hoạt động.
+            logger.warning(
+                "HTTP warmup skipped ({}: {}) — Playwright will navigate directly",
+                type(e).__name__, str(e)[:150],
+            )
+        finally:
+            # Mark warmed dù fail hay thành công, tránh retry vô ích mỗi page.
+            self._session_warmed = True
 
     def _load_field_names(self) -> None:
         try:

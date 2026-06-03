@@ -549,12 +549,28 @@ def _execute_search(
             "Chi tiết: file logs/tracker_*.log",
             reply_markup=_after_search_kb(include_closed),
         )
-    except Exception:
+    except Exception as _exc:
         logger.exception("interactive search failed")
+        _exc_str = f"{type(_exc).__name__} {_exc}".lower()
+        _is_network = any(k in _exc_str for k in (
+            "timeout", "connecttimeout", "connecterror", "connectionerror",
+            "network", "connection failed", "timed out", "connection refused",
+        ))
+        if _is_network:
+            _err_msg = (
+                "Không thể kết nối đến cổng muasamcong.\n"
+                "IP có thể đang bị throttle hoặc cổng tạm thời bảo trì.\n"
+                "Thử lại sau vài phút. Dùng /crawllogs để xem lịch sử cào."
+            )
+        else:
+            _err_msg = (
+                "Lỗi khi cào cổng. Dùng /crawllogs để xem chi tiết lỗi.\n"
+                "Nếu lỗi liên tục: thử PLAYWRIGHT_HEADLESS=false hoặc đổi IP."
+            )
         _reply(
             secrets.telegram_bot_token,
             target_chat_id,
-            "Lỗi khi cào hoặc gửi Telegram. Xem logs/ trên máy chạy bot.",
+            _err_msg,
             reply_markup=_after_search_kb(include_closed),
         )
 
@@ -746,9 +762,14 @@ def _execute_detail_fetch(
             reply_markup=_kb([[_btn("🏠 Menu", "menu")]]),
         )
         return
-    except Exception:
+    except Exception as _exc:
         logger.exception("/chitiet failed")
-        _reply(token, target_chat_id, "Lỗi khi cào cổng. Xem logs/.",
+        _exc_s = f"{type(_exc).__name__} {_exc}".lower()
+        if any(k in _exc_s for k in ("timeout", "connect", "network", "timed out")):
+            _emsg = "Không thể kết nối cổng muasamcong. Thử lại sau vài phút."
+        else:
+            _emsg = "Lỗi khi đọc chi tiết. Dùng /crawllogs để debug."
+        _reply(token, target_chat_id, _emsg,
                reply_markup=_kb([[_btn("🏠 Menu", "menu")]]))
         return
     finally:

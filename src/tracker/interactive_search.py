@@ -256,6 +256,17 @@ def run_interactive_keyword_search(
             logger.exception("db_search path failed — falling through to live crawl")
 
     # ── LIVE CRAWL (Playwright) — khi DB không có kết quả hoặc disabled ──────
+    # Ghi log để debug biết lý do fallback
+    from .tender_store import count_tenders as _count_tenders
+    try:
+        _catalog_size = _count_tenders()
+        logger.info(
+            "db_search miss → live crawl (catalog_size={}, db_enabled={}, phrases={})",
+            _catalog_size, db_enabled, uniq_early,
+        )
+    except Exception:
+        pass
+
     crawler = MuasamcongCrawler(
         page_size=secrets.crawl_page_size,
         use_playwright=secrets.use_playwright,
