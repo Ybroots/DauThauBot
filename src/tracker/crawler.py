@@ -37,13 +37,90 @@ def _httpx_ssl_verify() -> ssl.SSLContext | bool:
 
 
 def _retry_search_if_transient(exc: BaseException) -> bool:
-    """Không retry khi site key sai — lặp lại không có ích."""
+    """Quyết định có nên retry hay không.
+
+    Không retry khi:
+    - site key sai / invalid: lặp lại không giải quyết được
+    - timeout (Playwright page.goto hoặc httpx connect): site không khả dụng,
+      retry ngay sẽ cũng timeout → chỉ kéo dài thời gian block Telegram thread.
+      Trường hợp IP bị chặn: fail-fast rồi để scheduler thử lại sau 45 phút.
+    """
     msg = str(exc).lower()
+    exc_name = type(exc).__name__.lower()
+
     if "invalid site key" in msg or "invalid key type" in msg:
         return False
     if "grecaptcha_execute_missing" in msg:
         return False
+    # TimeoutError từ Playwright (page.goto timeout) hoặc httpx ConnectTimeout
+    if "timeout" in msg or "timeout" in exc_name:
+        return False
+    # Connection reset / site unreachable
+    if "connection" in exc_name and ("reset" in msg or "refused" in msg or "failed" in msg):
+        return False
     return True
+
+# ── Site circuit breaker ─────────────────────────────────────────────────────
+# Theo dõi các lần site không khả dụng liên tiếp. Sau N lần → set cooldown,
+# không mở Playwright thêm cho đến khi cooldown hết (giảm số session zombie).
+
+import threading as _threading
+from datetime import datetime as _dt, timezone as _tz_utc, timedelta as _td
+
+_site_cb_lock = _threading.Lock()
+_site_cb_failures = 0          # số lần timeout/unreachable liên tiếp
+_site_cb_cooldown_until: "_dt | None" = None
+_SITE_CB_THRESHOLD = 3         # Sau bao nhiêu lỗi liên tiếp thì set cooldown
+_SITE_CB_COOLDOWN_MIN = 10     # Cooldown bao nhiêu phút
+
+
+def _site_cb_record_failure() -> None:
+    """Ghi nhận 1 lần site không khả dụng."""
+    global _site_cb_failures, _site_cb_cooldown_until
+    with _site_cb_lock:
+        _site_cb_failures += 1
+        if _site_cb_failures >= _SITE_CB_THRESHOLD:
+            _site_cb_cooldown_until = _dt.now(_tz_utc()) + _td(minutes=_SITE_CB_COOLDOWN_MIN)
+            logger.warning(
+                "circuit_breaker: {} consecutive failures → site cooldown {}min until {}",
+                _site_cb_failures,
+                _SITE_CB_COOLDOWN_MIN,
+                _site_cb_cooldown_until.strftime("%H:%M:%S"),
+            )
+
+
+def _site_cb_record_success() -> None:
+    """Reset circuit breaker sau khi site phản hồi thành công."""
+    global _site_cb_failures, _site_cb_cooldown_until
+    with _site_cb_lock:
+        if _site_cb_failures > 0:
+            logger.info("circuit_breaker: reset after success (was {} failures)", _site_cb_failures)
+        _site_cb_failures = 0
+        _site_cb_cooldown_until = None
+
+
+def _site_cb_is_open() -> bool:
+    """True nếu đang trong cooldown (không nên thử Playwright)."""
+    global _site_cb_cooldown_until
+    with _site_cb_lock:
+        if _site_cb_cooldown_until is None:
+            return False
+        if _dt.now(_tz_utc()) >= _site_cb_cooldown_until:
+            _site_cb_cooldown_until = None
+            _site_cb_failures = 0
+            logger.info("circuit_breaker: cooldown expired — will retry site")
+            return False
+        return True
+
+
+def site_status() -> str:
+    """Trả chuỗi mô tả trạng thái circuit breaker — cho /trangthai."""
+    with _site_cb_lock:
+        if _site_cb_cooldown_until and _dt.now(_tz_utc()) < _site_cb_cooldown_until:
+            mins = int((_site_cb_cooldown_until - _dt.now(_tz_utc())).total_seconds() / 60) + 1
+            return f"⚠️ site cooldown {mins}min ({_site_cb_failures} lỗi liên tiếp)"
+        return f"✅ ok (failures={_site_cb_failures})"
+
 
 USER_AGENTS = [
     (
@@ -656,7 +733,7 @@ class MuasamcongCrawler:
                 pass
             _, page = self._pw_new_page(context)
 
-        page.goto(INDEX_URL, wait_until="load", timeout=60_000)
+        page.goto(INDEX_URL, wait_until="load", timeout=30_000)
         logger.info("Playwright: đã tải xong trang index cổng")
         self._pw_stabilize(page, nav_try)
 
@@ -682,6 +759,10 @@ class MuasamcongCrawler:
             "Playwright: bắt đầu trang ES {} (smart/search)…",
             payload[0].get("pageNumber"),
         )
+
+        # Circuit breaker: nếu site đã xác nhận unreachable → fail fast, đừng mở browser
+        if _site_cb_is_open():
+            raise BlockedException(503)
 
         last_err: Optional[BaseException] = None
         for session_try in range(3):
@@ -724,9 +805,19 @@ class MuasamcongCrawler:
                                 if isinstance(content, list):
                                     n = len(content)
                             logger.info("Playwright: smart/search xong — {} dòng trong trang", n)
+                            _site_cb_record_success()
                             return data
                         except PlaywrightError as e:
                             last_err = e
+                            err_lower = str(e).lower()
+                            # Timeout = site unreachable → ghi circuit breaker, đừng retry
+                            if "timeout" in err_lower:
+                                _site_cb_record_failure()
+                                logger.warning(
+                                    "Playwright timeout (session {} nav {}) — site unreachable, fail fast",
+                                    session_try, nav_try,
+                                )
+                                raise
                             if self._pw_ctx_destroyed(e):
                                 logger.warning(
                                     "Playwright context lost (session {} nav {}): {}",

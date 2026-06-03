@@ -47,6 +47,7 @@ from .storage import (
     toggle_group_active,
     total_bids_in_db,
 )
+from .crawler import site_status as _crawler_site_status
 from .tender_store import (
     count_tenders,
     get_last_crawl_time,
@@ -1232,6 +1233,7 @@ def handle_slash(
             f"  • Catalog tenders: <b>{tender_total}</b> gói ({tender_open} đang mở)",
             f"  • Cập nhật catalog lần cuối: {last_crawl_str}",
             f"  • DB-search (/tim): {db_mode}",
+            f"  • Site circuit breaker: {_crawler_site_status()}",
             f"  • Bây giờ (UTC): {utc_now}",
         ]
 
