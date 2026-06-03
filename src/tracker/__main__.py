@@ -6,7 +6,7 @@ import time
 from loguru import logger
 
 from .config import PROJECT_ROOT, Secrets, load_keywords_yaml
-from .crawler import BlockedException, MuasamcongCrawler
+from .crawler import BlockedException, MuasamcongCrawler, _site_cb_is_open
 from .filter import match_bid
 from .formatter import format_bid_message
 from .models import Bid
@@ -75,6 +75,17 @@ def _collect_bids_crawl(
     )
     merged: dict[str, Bid] = {}
     for i, kw in enumerate(kws):
+        # Nếu circuit breaker đang mở (site unreachable) → dừng ngay,
+        # không lãng phí thêm 30s timeout cho mỗi keyword còn lại.
+        if _site_cb_is_open():
+            logger.warning(
+                "circuit_breaker open after {}/{} keywords — stopping cron early",
+                i, len(kws),
+            )
+            if merged:
+                break  # Vẫn trả về data đã cào được (nếu có)
+            raise BlockedException(503)
+
         if i > 0 and secrets.crawl_keyword_gap_max_seconds > 0:
             lo = float(secrets.crawl_keyword_gap_min_seconds)
             hi = float(secrets.crawl_keyword_gap_max_seconds)
@@ -82,10 +93,21 @@ def _collect_bids_crawl(
             logger.info("Nghỉ {:.1f}s trước từ khóa tiếp theo…", gap)
             time.sleep(gap)
         logger.info("Từ khóa [{}/{}]: {!r}", i + 1, len(kws), kw)
-        chunk = crawler.fetch_recent_bids(
-            max_pages=secrets.crawl_max_pages,
-            server_keyword=kw,
-        )
+        try:
+            chunk = crawler.fetch_recent_bids(
+                max_pages=secrets.crawl_max_pages,
+                server_keyword=kw,
+            )
+        except BlockedException:
+            logger.warning("Keyword {!r} blocked — skipping remaining keywords", kw)
+            break  # site đang block, dừng loop
+        except Exception as e:
+            # Network error cho 1 keyword → skip keyword này, thử keyword tiếp
+            logger.warning(
+                "Keyword {!r} failed ({}: {}) — skipping this keyword",
+                kw, type(e).__name__, str(e)[:100],
+            )
+            continue
         for b in chunk:
             merged[b.tbmt_code] = b
     out = list(merged.values())

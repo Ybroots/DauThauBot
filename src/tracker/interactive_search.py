@@ -256,7 +256,13 @@ def run_interactive_keyword_search(
             logger.exception("db_search path failed — falling through to live crawl")
 
     # ── LIVE CRAWL (Playwright) — khi DB không có kết quả hoặc disabled ──────
-    # Ghi log để debug biết lý do fallback
+    # Kiểm circuit breaker TRƯỚC KHI khởi động Playwright.
+    # Nếu đang trong cooldown → raise BlockedException ngay (< 1ms),
+    # tránh chờ 30s timeout rồi mới báo lỗi.
+    from .crawler import _site_cb_is_open as _cb_open
+    if _cb_open():
+        raise BlockedException(503)
+
     from .tender_store import count_tenders as _count_tenders
     try:
         _catalog_size = _count_tenders()

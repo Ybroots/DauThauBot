@@ -47,7 +47,7 @@ from .storage import (
     toggle_group_active,
     total_bids_in_db,
 )
-from .crawler import site_status as _crawler_site_status
+from .crawler import site_status as _crawler_site_status, _site_cb_is_open as _crawler_cb_open
 from .tender_store import (
     count_tenders,
     get_last_crawl_time,
@@ -484,11 +484,23 @@ def _execute_search(
         filter_notes.append("Qua mạng" if bid_method_filter == 1 else "Không qua mạng")
     filter_note = f" | {'; '.join(filter_notes)}" if filter_notes else ""
     kw_note = f'"{", ".join(phrases)}"' if phrases else "duyệt tất cả"
-    _reply(
-        secrets.telegram_bot_token,
-        target_chat_id,
-        f"Đang tra Muasamcong — {kw_note}{mode_note}{scope_note}{filter_note}\n(Playwright có thể mất 30–90 giây)…",
-    )
+
+    # Nếu circuit breaker đang mở (site unreachable đã được xác nhận)
+    # → báo ngay mà không cần chờ 30s timeout.
+    # DB-first vẫn chạy bình thường (không cần network).
+    if _crawler_cb_open():
+        _reply(
+            secrets.telegram_bot_token,
+            target_chat_id,
+            "⚠️ Cổng muasamcong hiện không khả dụng từ server (IP bị chặn hoặc bảo trì).\n"
+            "Kết quả sẽ từ kho dữ liệu đã lưu nếu có; ngược lại thử lại sau.",
+        )
+    else:
+        _reply(
+            secrets.telegram_bot_token,
+            target_chat_id,
+            f"Đang tra Muasamcong — {kw_note}{mode_note}{scope_note}{filter_note}\n(Playwright có thể mất 30–90 giây)…",
+        )
     try:
         sent, total, summary, matched_bids = run_interactive_keyword_search(
             secrets,
