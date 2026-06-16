@@ -1,6 +1,7 @@
 # Docker: playwright==1.49.0 phải khớp image mcr.microsoft.com/playwright/python:v1.49.0-jammy
 playwright==1.49.0
 httpx[http2]>=0.27.0
+flask>=3.0
 pydantic>=2.0
 pydantic-settings>=2.0
 pyyaml>=6.0

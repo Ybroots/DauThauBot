@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
     "httpx[http2]>=0.27.0",
+    "flask>=3.0",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "pyyaml>=6.0",
@@ -37,7 +38,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 
 [tool.vercel]
-entrypoint = "api/index.py"
+entrypoint = "app:app"
 
 [tool.ruff]
 line-length = 100

@@ -3,11 +3,13 @@
 Vercel chi phu hop chay theo HTTP function/cron, khong phu hop process 24/7.
 Repo nay them:
 
-- `api/index.py`: WSGI entrypoint chinh cho Vercel
+- `app.py`: Flask entrypoint chinh cho Vercel
+- `index.py`, `main.py`: wrapper de Vercel scan entrypoint chuan
+- `api/index.py`: WSGI fallback/compatibility entrypoint
 - `/api/health`: kiem tra deploy
 - `/api/cron`: chay mot vong `run_once()`
 - `vercel.json`: cau hinh Python Function va Vercel Cron moi gio
-- `pyproject.toml`: `tool.vercel.entrypoint = "api/index.py"`
+- `pyproject.toml`: `tool.vercel.entrypoint = "app:app"`
 
 ## Cach deploy
 
