@@ -3,9 +3,11 @@
 Vercel chi phu hop chay theo HTTP function/cron, khong phu hop process 24/7.
 Repo nay them:
 
-- `api/health.py`: kiem tra deploy tai `/api/health`
-- `api/cron.py`: chay mot vong `run_once()` tai `/api/cron`
+- `api/index.py`: WSGI entrypoint chinh cho Vercel
+- `/api/health`: kiem tra deploy
+- `/api/cron`: chay mot vong `run_once()`
 - `vercel.json`: cau hinh Python Function va Vercel Cron moi gio
+- `pyproject.toml`: `tool.vercel.entrypoint = "api/index.py"`
 
 ## Cach deploy
 

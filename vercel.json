@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "installCommand": "pip install -r requirements.txt",
   "functions": {
-    "api/*.py": {
+    "api/index.py": {
       "maxDuration": 300,
       "excludeFiles": "{.venv/**,venv/**,tests/**,.pytest_cache/**,.ruff_cache/**,data/**,logs/**,.clone/**,.claude/**,_plugin-package/**,wordpress-logo-aligner/**,*.zip}"
     }

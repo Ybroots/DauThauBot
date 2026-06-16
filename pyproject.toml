@@ -36,6 +36,9 @@ packages = ["src/tracker"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
+[tool.vercel]
+entrypoint = "api/index.py"
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"
