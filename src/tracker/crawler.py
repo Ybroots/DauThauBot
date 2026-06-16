@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import ssl
 import time
@@ -17,12 +18,8 @@ BASE_URL = "https://muasamcong.mpi.gov.vn"
 HOMEPAGE_PATH = "/web/guest/contractor-selection"
 SEARCH_ENDPOINT = "/o/egp-portal-contractor-selection-v2/services/smart/search"
 CATEGORY_ENDPOINT = "/o/egp-portal-contractor-selection-v2/services/get/category"
-INDEX_URL = (
-    f"{BASE_URL}/web/guest/contractor-selection"
-    "?p_p_id=egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2"
-    "&p_p_lifecycle=0&p_p_state=normal&p_p_mode=view"
-    "&_egpportalcontractorselectionv2_WAR_egpportalcontractorselectionv2_render=index"
-)
+INDEX_PATH = f"{HOMEPAGE_PATH}?render=index"
+INDEX_URL = f"{BASE_URL}{INDEX_PATH}"
 RECAPTCHA_SITE_KEY = "6LfCo9gpAAAAAL1u9qzvWYSrZuYkFsFEjpVruyd5"
 
 
@@ -48,9 +45,13 @@ def _retry_search_if_transient(exc: BaseException) -> bool:
     msg = str(exc).lower()
     exc_name = type(exc).__name__.lower()
 
+    if exc_name == "blockedexception":
+        return False
     if "invalid site key" in msg or "invalid key type" in msg:
         return False
     if "grecaptcha_execute_missing" in msg:
+        return False
+    if "net::err_connection" in msg:
         return False
     # TimeoutError từ Playwright (page.goto timeout) hoặc httpx ConnectTimeout
     if "timeout" in msg or "timeout" in exc_name:
@@ -65,7 +66,7 @@ def _retry_search_if_transient(exc: BaseException) -> bool:
 # không mở Playwright thêm cho đến khi cooldown hết (giảm số session zombie).
 
 import threading as _threading
-from datetime import datetime as _dt, timezone as _tz_utc, timedelta as _td
+from datetime import datetime as _dt, timezone as _timezone, timedelta as _td
 
 _site_cb_lock = _threading.Lock()
 _site_cb_failures = 0          # số lần timeout/unreachable liên tiếp
@@ -80,7 +81,7 @@ def _site_cb_record_failure() -> None:
     with _site_cb_lock:
         _site_cb_failures += 1
         if _site_cb_failures >= _SITE_CB_THRESHOLD:
-            _site_cb_cooldown_until = _dt.now(_tz_utc()) + _td(minutes=_SITE_CB_COOLDOWN_MIN)
+            _site_cb_cooldown_until = _dt.now(_timezone.utc) + _td(minutes=_SITE_CB_COOLDOWN_MIN)
             logger.warning(
                 "circuit_breaker: {} consecutive failures → site cooldown {}min until {}",
                 _site_cb_failures,
@@ -101,11 +102,11 @@ def _site_cb_record_success() -> None:
 
 def _site_cb_is_open() -> bool:
     """True nếu đang trong cooldown (không nên thử Playwright)."""
-    global _site_cb_cooldown_until
+    global _site_cb_failures, _site_cb_cooldown_until
     with _site_cb_lock:
         if _site_cb_cooldown_until is None:
             return False
-        if _dt.now(_tz_utc()) >= _site_cb_cooldown_until:
+        if _dt.now(_timezone.utc) >= _site_cb_cooldown_until:
             _site_cb_cooldown_until = None
             _site_cb_failures = 0
             logger.info("circuit_breaker: cooldown expired — will retry site")
@@ -116,8 +117,8 @@ def _site_cb_is_open() -> bool:
 def site_status() -> str:
     """Trả chuỗi mô tả trạng thái circuit breaker — cho /trangthai."""
     with _site_cb_lock:
-        if _site_cb_cooldown_until and _dt.now(_tz_utc()) < _site_cb_cooldown_until:
-            mins = int((_site_cb_cooldown_until - _dt.now(_tz_utc())).total_seconds() / 60) + 1
+        if _site_cb_cooldown_until and _dt.now(_timezone.utc) < _site_cb_cooldown_until:
+            mins = int((_site_cb_cooldown_until - _dt.now(_timezone.utc)).total_seconds() / 60) + 1
             return f"⚠️ site cooldown {mins}min ({_site_cb_failures} lỗi liên tiếp)"
         return f"✅ ok (failures={_site_cb_failures})"
 
@@ -326,6 +327,11 @@ class MuasamcongCrawler:
                 headers={"User-Agent": self.user_agent},
             )
 
+    def _fail_fast_if_site_blocked(self) -> None:
+        """Không warmup hay gọi category khi breaker đang mở."""
+        if _site_cb_is_open():
+            raise BlockedException(503)
+
     def _human_delay(self, min_s: float = 2.0, max_s: float = 6.0) -> None:
         delay = random.uniform(min_s, max_s)
         elapsed = time.time() - self._last_request_at
@@ -345,7 +351,7 @@ class MuasamcongCrawler:
         logger.debug("Warming up session (GET homepage)...")
         try:
             r = self.client.get(
-                HOMEPAGE_PATH,
+                INDEX_PATH,
                 timeout=15.0,  # Short — fail fast, Playwright takes over
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -391,7 +397,7 @@ class MuasamcongCrawler:
 
     def _api_headers(self) -> dict[str, str]:
         return {
-            "Referer": f"{BASE_URL}{HOMEPAGE_PATH}",
+            "Referer": INDEX_URL,
             "Origin": BASE_URL,
             "X-Requested-With": "XMLHttpRequest",
             "Sec-Fetch-Dest": "empty",
@@ -413,6 +419,7 @@ class MuasamcongCrawler:
         from .models import Bid
 
         max_pages = max(1, min(max_pages, max_pages_cap))
+        self._fail_fast_if_site_blocked()
         self._warmup_session()
         self._load_field_names()
 
@@ -521,6 +528,53 @@ class MuasamcongCrawler:
         msg = str(exc).lower()
         return "execution context was destroyed" in msg or "context was destroyed" in msg
 
+    @staticmethod
+    def _pw_is_timeout(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return "timeout" in type(exc).__name__.lower() or "timeout" in msg
+
+    @staticmethod
+    def _pw_connection_unreachable(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(
+            marker in msg
+            for marker in (
+                "net::err_connection_reset",
+                "net::err_connection_closed",
+                "net::err_connection_refused",
+                "net::err_connection_timed_out",
+                "net::err_internet_disconnected",
+            )
+        )
+
+    @staticmethod
+    def _pw_has_usable_dom(page: Any) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                        const state = document.readyState;
+                        return Boolean(document.body) && state !== 'loading';
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pw_portal_unavailable(page: Any) -> bool:
+        try:
+            body = page.evaluate(
+                """() => (document.body && document.body.innerText || '').slice(0, 3000)"""
+            )
+        except Exception:
+            return False
+        text = str(body).lower()
+        return (
+            "egp-portal-contractor-selection-v2 is temporarily unavailable" in text
+            or "internal error" in text
+        )
+
     def _pw_stabilize(self, page: Any, nav_try: int) -> None:
         """Chờ reCAPTCHA + mạng nguôi — không gọi evaluate dài (dễ vỡ khi SPA redirect)."""
         try:
@@ -532,6 +586,8 @@ class MuasamcongCrawler:
         g_start = time.time()
         g_last_log = g_start
         while time.time() < g_deadline:
+            if self._pw_portal_unavailable(page):
+                raise RuntimeError("portal contractor-selection page is temporarily unavailable")
             if page.evaluate("() => typeof grecaptcha !== 'undefined'"):
                 logger.info(
                     "Playwright: reCAPTCHA đã có trên trang sau {:.0f}s",
@@ -678,6 +734,15 @@ class MuasamcongCrawler:
         Timeout 20s để fail fast nếu OS không spawn được subprocess
         (đã từng hang 8h khi không có timeout — Railway resource exhaustion).
         """
+        connect_url = os.environ.get("PLAYWRIGHT_CONNECT_URL", "").strip()
+        cdp_url = os.environ.get("PLAYWRIGHT_CDP_URL", "").strip()
+        if connect_url:
+            logger.info("Playwright: connecting to remote browser (playwright ws)")
+            return p.chromium.connect(connect_url, timeout=20_000)
+        if cdp_url:
+            logger.info("Playwright: connecting to remote browser (cdp)")
+            return p.chromium.connect_over_cdp(cdp_url, timeout=20_000)
+
         launch_kw: dict[str, Any] = {
             "headless": self.playwright_headless,
             "timeout": 20_000,  # 20s — không để mãi
@@ -733,8 +798,19 @@ class MuasamcongCrawler:
                 pass
             _, page = self._pw_new_page(context)
 
-        page.goto(INDEX_URL, wait_until="load", timeout=30_000)
-        logger.info("Playwright: đã tải xong trang index cổng")
+        try:
+            response = page.goto(INDEX_URL, wait_until="domcontentloaded", timeout=45_000)
+            status = response.status if response else "n/a"
+            logger.info("Playwright: đã tải DOM trang index cổng (HTTP {})", status)
+        except Exception as e:
+            if self._pw_connection_unreachable(e):
+                _site_cb_record_failure()
+                raise BlockedException(503) from e
+            if not self._pw_is_timeout(e) or not self._pw_has_usable_dom(page):
+                raise
+            logger.warning(
+                "Playwright: page.goto timeout nhưng DOM đã sẵn sàng — tiếp tục chờ reCAPTCHA"
+            )
         self._pw_stabilize(page, nav_try)
 
         render_key = self._pw_extract_site_key(page)
@@ -990,6 +1066,7 @@ class MuasamcongCrawler:
             return {}
 
         max_pages = max(1, min(max_pages, max_pages_cap))
+        self._fail_fast_if_site_blocked()
         self._warmup_session()
         self._load_field_names()
 
@@ -1072,6 +1149,7 @@ class MuasamcongCrawler:
         payload_pages: list[Bid] = []
         max_pages = 2
 
+        self._fail_fast_if_site_blocked()
         self._warmup_session()
         self._load_field_names()
 
